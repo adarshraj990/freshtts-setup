@@ -121,10 +121,19 @@ The Colab backend replicates the architectural foundation of `Aviranjanprasad/Bh
 
 ---
 
-### 6. File Deliverables Summary
+### 6. Dependency Matrix & Stability Fixes
+To prevent the runtime failure `ImportError: cannot import name 'HfFolder' from 'huggingface_hub'`:
+- Original Gradio 4.40.0 requires `HfFolder`, which was deprecated in `huggingface_hub>=0.23.0`.
+- We pin `huggingface_hub<0.23.0` while strictly preserving original packages (`TTS==0.22.0`, `gradio==4.40.0`, `spaces`, `torch`, `torchaudio`, `soundfile`, `scipy`, `numpy`, `librosa`, `setuptools<70.0.0`).
+- Appended dependencies: `pysrt`, `pydub`, `gradio_client`, `huggingface_hub<0.23.0`.
 
-1. `PRD.md`: This comprehensive specifications and progress document.
+---
+
+### 7. File Deliverables Summary
+
+1. `PRD.md`: This comprehensive specifications, dependency strategy, and progress document.
 2. `README.md`: Operational guide detailing root voice placement and Colab setup.
-3. `requirements.txt`: Minimal frontend requirements (`gradio`, `gradio_client`, `pysrt`, `pydub`).
+3. `requirements.txt`: Preserved original dependencies with `pysrt`, `pydub`, `gradio_client`, and `huggingface_hub<0.23.0`.
 4. `colab_backend_script.md`: Exact Python script replicating Bhojpuri XTTS logic for Colab T4 GPU.
 5. `app.py`: Clean Hugging Face Space Gradio frontend application.
+

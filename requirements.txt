@@ -1,4 +1,14 @@
-gradio
-gradio_client
+TTS==0.22.0
+gradio==4.40.0
+spaces
+torch
+torchaudio
+soundfile
+scipy
+numpy
+librosa
+setuptools<70.0.0
 pysrt
 pydub
+gradio_client
+huggingface_hub<0.23.0

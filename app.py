@@ -17,7 +17,13 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import gradio as gr
-from gradio_client import Client, handle_file
+from gradio_client import Client
+try:
+    from gradio_client import handle_file
+except ImportError:
+    def handle_file(path):
+        return str(path)
+
 from pydub import AudioSegment
 import pysrt
 
