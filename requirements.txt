@@ -1,4 +1,3 @@
-audioop-lts
 gradio
 gradio_client
 pysrt
