@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Interim chunks and audio test runs (keep directory structure with .gitkeep)
+temp_chunks/*
+!temp_chunks/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Unit test outputs and generated master dubs
+unit_test_*.wav
+final_dubbed_output.wav
+*.wav
+*.mp3
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

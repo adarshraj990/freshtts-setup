@@ -1,0 +1,4 @@
+gradio
+gradio_client
+pysrt
+pydub
