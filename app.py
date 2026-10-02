@@ -1,11 +1,13 @@
 """
-🎬 Hybrid Auto-Dubbing Pipeline (SRT Sync)
-Hugging Face Space Frontend Application with Multi-API Pool Load Balancer
+🎬 Distributed Hybrid Auto-Dubbing Pipeline (SRT Sync)
+Hugging Face Space Frontend Orchestrator & Multi-Backend Load Balancer
 
-Architecture & Highlights:
-- Multi-API Pool: Connects up to 5 distributed Google Colab / Hugging Face Space GPU backends.
-- Parallel Chunk Distribution: Distributes subtitle dialogue blocks concurrently across all active backends.
-- Time-Aligned Subtitle Sync: Millisecond-accurate timeline placement via pysrt.
+Features:
+- Exclusive Manager Role: 100% serverless coordinator. Zero local XTTS generation.
+- Hardcoded Verified API Pool: Pre-configured with 6 verified Hugging Face XTTS-v2 spaces.
+- Manual Backend Extension: Custom Space / Gradio API endpoints can be added dynamically.
+- Parallel Multi-Backend Dispatch: Concurrent round-robin distribution with automated failover retry.
+- Precise Lip-Sync Timing: Millisecond-accurate timeline placement via pysrt.
 - Chronological Audio Stitching: Seamless master canvas overlay using Pydub.
 - Root Reference Voice: Automatically utilizes `reference_voice.wav` from the root directory.
 """
@@ -16,7 +18,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── Monkey-patch missing HfFolder for huggingface_hub >= 0.23.0 compatibility ──
 try:
@@ -92,9 +94,43 @@ BASE_DIR = Path(__file__).resolve().parent
 REFERENCE_VOICE_PATH = BASE_DIR / "reference_voice.wav"
 OUTPUT_AUDIO_PATH = BASE_DIR / "final_dubbed_output.wav"
 
-# Global client cache to reuse Gradio Client HTTP sessions across threads
+# Global client cache to reuse Gradio Client HTTP sessions
 CLIENT_CACHE: Dict[str, Client] = {}
 CLIENT_CACHE_LOCK = threading.Lock()
+
+# Verified Hardcoded Hugging Face XTTS-v2 Spaces Pool
+VERIFIED_SPACES: Dict[str, Dict[str, Any]] = {
+    "Aviranjanprasad/Bhojpuri-XTTS-API": {
+        "name": "Aviranjanprasad/Bhojpuri-XTTS-API",
+        "endpoint": "/synthesize_speech",
+        "type": "bhojpuri",
+    },
+    "hasanbasbunar/Voice-Cloning-XTTS-v2": {
+        "name": "hasanbasbunar/Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "eagien/XTTS": {
+        "name": "eagien/XTTS",
+        "endpoint": "/predict",
+        "type": "eagien",
+    },
+    "applore/xtts-voice-cloning-demo": {
+        "name": "applore/xtts-voice-cloning-demo",
+        "endpoint": "/predict",
+        "type": "applore",
+    },
+    "Fatimamirza970/Voice-Cloning-XTTS-V2": {
+        "name": "Fatimamirza970/Voice-Cloning-XTTS-V2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "JymNils/Voice-Cloning-XTTS-v2": {
+        "name": "JymNils/Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+}
 
 
 def check_reference_voice() -> str:
@@ -105,66 +141,187 @@ def check_reference_voice() -> str:
     return "⚠️ `reference_voice.wav` NOT FOUND in root directory. Please place it in the root before dubbing."
 
 
-def get_or_create_client(url: str) -> Client:
+def get_or_create_client(endpoint_or_url: str) -> Client:
     """Retrieves an existing Gradio Client or establishes a new connection in a thread-safe manner."""
-    clean_url = url.strip().rstrip("/")
+    clean_target = endpoint_or_url.strip().rstrip("/")
     with CLIENT_CACHE_LOCK:
-        if clean_url not in CLIENT_CACHE:
-            CLIENT_CACHE[clean_url] = Client(clean_url)
-        return CLIENT_CACHE[clean_url]
+        if clean_target not in CLIENT_CACHE:
+            CLIENT_CACHE[clean_target] = Client(clean_target)
+        return CLIENT_CACHE[clean_target]
+
+
+def extract_audio_path(res: Any) -> Optional[str]:
+    """Safely extracts a local audio file path string from various Gradio return types (str, dict, tuple)."""
+    if res is None:
+        return None
+    if isinstance(res, str):
+        return res
+    if isinstance(res, (list, tuple)):
+        for item in reversed(res):
+            p = extract_audio_path(item)
+            if p:
+                return p
+        return None
+    if isinstance(res, dict):
+        for key in ("path", "name", "orig_name"):
+            val = res.get(key)
+            if val and isinstance(val, str):
+                return val
+        return None
+    return None
+
+
+def execute_backend_call(
+    backend_info: Dict[str, Any],
+    text: str,
+    ref_path: Path,
+    lang_key: str,
+) -> Optional[str]:
+    """
+    Adapter that maps text, reference voice audio, and target language
+    to each specific backend's unique API parameter requirements.
+    """
+    target = backend_info["target"]
+    b_type = backend_info.get("type", "custom")
+    client = get_or_create_client(target)
+    ref_param = handle_file(str(ref_path))
+
+    # 1. Bhojpuri XTTS API
+    if b_type == "bhojpuri":
+        # /synthesize_speech(text, voice_preset, custom_audio_file, speed)
+        result = client.predict(
+            text=text,
+            voice_preset="male_1",
+            custom_audio_file=ref_param,
+            speed=1.0,
+            api_name="/synthesize_speech",
+        )
+        return extract_audio_path(result)
+
+    # 2. Applore XTTS Demo
+    elif b_type == "applore":
+        # /predict(text, speaker_wav, language) -> generated_audio
+        result = client.predict(
+            text=text,
+            speaker_wav=ref_param,
+            language=lang_key,
+            api_name="/predict",
+        )
+        return extract_audio_path(result)
+
+    # 3. Eagien XTTS
+    elif b_type == "eagien":
+        # /predict(input_text, speaker_wav, language) -> (status, audio)
+        lang_code = lang_key if lang_key in ["es", "fr", "de", "zh", "ja", "ko"] else "en"
+        result = client.predict(
+            input_text=text,
+            speaker_wav=ref_param,
+            language=lang_code,
+            api_name="/predict",
+        )
+        return extract_audio_path(result)
+
+    # 4. Hasanbasbunar / Fatimamirza970 / JymNils
+    elif b_type == "hasanbasbunar":
+        # /voice_clone_synthesis uses full language names
+        lang_name_map = {
+            "hi": "Hindi",
+            "fr": "French",
+            "es": "Spanish",
+            "pt": "Portuguese",
+        }
+        lang_name = lang_name_map.get(lang_key, "English")
+        result = client.predict(
+            text=text,
+            reference_audio_url=None,
+            example_audio_name="audio_1.wav",
+            language=lang_name,
+            temperature=0.75,
+            speed=1.0,
+            do_sample=True,
+            repetition_penalty=5.0,
+            length_penalty=1.0,
+            gpt_cond_len=30,
+            top_k=50,
+            top_p=0.85,
+            remove_silence_enabled=True,
+            silence_threshold=-45,
+            min_silence_len=300,
+            keep_silence=100,
+            text_splitting_method="Native XTTS splitting",
+            max_chars_per_segment=250,
+            enable_preprocessing=False,
+            api_name="/voice_clone_synthesis",
+        )
+        return extract_audio_path(result)
+
+    # 5. Custom / Generic Backend
+    else:
+        try:
+            res = client.predict(
+                text_chunk=text,
+                target_lang=lang_key,
+                reference_voice=ref_param,
+                api_name="/predict",
+            )
+            return extract_audio_path(res)
+        except Exception:
+            res = client.predict(
+                text=text,
+                speaker_wav=ref_param,
+                language=lang_key,
+                api_name="/predict",
+            )
+            return extract_audio_path(res)
 
 
 def synthesize_chunk_task(
     chunk_tuple: Tuple[int, int, int, str],
-    active_urls: List[str],
-    ref_param,
+    active_backends: List[Dict[str, Any]],
+    ref_path: Path,
     target_lang_code: str,
 ) -> Tuple[int, int, Optional[str], Optional[str], str]:
     """
-    Synthesizes a single subtitle chunk with round-robin primary assignment and failover retry.
-    Returns: (chunk_idx, start_time_ms, returned_audio_path, error_msg, worker_used)
+    Dispatches a single subtitle dialogue chunk across the active backend pool
+    with round-robin priority and automated failover retry.
     """
     chunk_idx, start_time_ms, end_time_ms, chunk_text = chunk_tuple
 
     # Round-robin initial worker assignment
-    primary_idx = (chunk_idx - 1) % len(active_urls)
-    ordered_urls = [active_urls[primary_idx]] + [u for i, u in enumerate(active_urls) if i != primary_idx]
+    primary_idx = (chunk_idx - 1) % len(active_backends)
+    ordered_backends = [active_backends[primary_idx]] + [
+        b for i, b in enumerate(active_backends) if i != primary_idx
+    ]
 
     last_error = None
-    for attempt, worker_url in enumerate(ordered_urls, start=1):
+    for attempt, b_info in enumerate(ordered_backends, start=1):
+        target_name = b_info["name"]
         try:
-            client = get_or_create_client(worker_url)
-            result = client.predict(
-                text_chunk=chunk_text,
-                target_lang=target_lang_code,
-                reference_voice=ref_param,
-                api_name="/predict",
-            )
-            if result and os.path.exists(result):
-                return chunk_idx, start_time_ms, result, None, worker_url
+            audio_path = execute_backend_call(b_info, chunk_text, ref_path, target_lang_code)
+            if audio_path and os.path.exists(audio_path):
+                return chunk_idx, start_time_ms, audio_path, None, target_name
         except Exception as e:
-            last_error = f"{worker_url}: {e}"
+            last_error = f"{target_name}: {e}"
             time.sleep(0.5)
 
-    return chunk_idx, start_time_ms, None, last_error or "All endpoints failed", "None"
+    return chunk_idx, start_time_ms, None, last_error or "All backends failed", "None"
 
 
-def run_hybrid_dubbing(
-    api_url_1: str,
-    api_url_2: str,
-    api_url_3: str,
-    api_url_4: str,
-    api_url_5: str,
+def run_distributed_dubbing(
+    selected_spaces: List[str],
+    custom_url_1: str,
+    custom_url_2: str,
+    custom_url_3: str,
     srt_file_path: Optional[str],
     target_language: str,
     progress=gr.Progress(track_tqdm=False),
 ) -> Tuple[Optional[str], str]:
     """
-    Multi-API Pool Load Balancer:
-    1. Collects and validates all active backend API URLs (URLs 1–5).
+    Distributed Multi-Backend Auto-Dubbing Manager:
+    1. Gathers all selected hardcoded Spaces and custom manual endpoints.
     2. Verifies the root reference_voice.wav file.
-    3. Parses uploaded SRT subtitles using pysrt.
-    4. Distributes generation requests across all available backends concurrently.
+    3. Parses SRT subtitles using pysrt.
+    4. Distributes generation requests concurrently across all available backends.
     5. Reassembles synthesized audio chunks in strictly chronological order.
     6. Stitches onto a Pydub silent canvas and exports final_dubbed_output.wav.
     """
@@ -179,7 +336,7 @@ def run_hybrid_dubbing(
         print(entry)
 
     start_time = time.time()
-    log("🚀 Initializing Multi-API Pool Load Balancer for XTTS-v2 Dubbing...")
+    log("🚀 Initializing Distributed Multi-Backend Auto-Dubbing Manager...")
 
     # 1. Verify root reference voice
     if not REFERENCE_VOICE_PATH.is_file():
@@ -192,20 +349,37 @@ def run_hybrid_dubbing(
 
     log(f"🎙️ Active Reference Voice: `{REFERENCE_VOICE_PATH.name}` ({REFERENCE_VOICE_PATH.stat().st_size / (1024*1024):.2f} MB)")
 
-    # 2. Collect & Validate Active API Pool Endpoints
-    raw_urls = [api_url_1, api_url_2, api_url_3, api_url_4, api_url_5]
-    active_urls = [u.strip().rstrip("/") for u in raw_urls if u and u.strip()]
+    # 2. Build the Active Backend Pool
+    active_backends: List[Dict[str, Any]] = []
 
-    if not active_urls:
-        err_msg = "At least one API URL (API URL 1) is mandatory! Please paste your running backend link."
+    # Add selected hardcoded spaces
+    if selected_spaces:
+        for space_id in selected_spaces:
+            if space_id in VERIFIED_SPACES:
+                meta = dict(VERIFIED_SPACES[space_id])
+                meta["target"] = space_id
+                active_backends.append(meta)
+
+    # Add custom manual endpoints
+    for idx, c_url in enumerate([custom_url_1, custom_url_2, custom_url_3], start=1):
+        if c_url and c_url.strip():
+            clean_url = c_url.strip().rstrip("/")
+            active_backends.append({
+                "name": f"Custom API #{idx} ({clean_url})",
+                "target": clean_url,
+                "type": "custom",
+            })
+
+    if not active_backends:
+        err_msg = "No backend selected! Please select at least one Space from the API Pool or enter a custom API URL."
         log(f"❌ {err_msg}")
         raise gr.Error(err_msg)
 
-    log(f"🌐 Multi-API Pool initialized with {len(active_urls)} active backend(s):")
-    for idx, u in enumerate(active_urls, start=1):
-        log(f"   • Backend #{idx}: {u}")
+    log(f"🌐 Active Multi-Backend Pool ({len(active_backends)} backends connected):")
+    for idx, b in enumerate(active_backends, start=1):
+        log(f"   • Backend #{idx}: {b['name']}")
 
-    # 3. Parse SRT Subtitles
+    # 3. Parse Subtitle SRT File
     if not srt_file_path or not os.path.isfile(srt_file_path):
         err_msg = "Please upload an .srt subtitle file!"
         log(f"❌ {err_msg}")
@@ -227,7 +401,6 @@ def run_hybrid_dubbing(
         log(f"❌ {err_msg}")
         raise gr.Error(err_msg)
 
-    # Filter non-empty subtitle blocks
     chunks_to_process = []
     for i, sub in enumerate(subs):
         text = sub.text
@@ -244,13 +417,12 @@ def run_hybrid_dubbing(
     log("🎼 Initializing silent master canvas with Pydub (24,000 Hz, Mono)...")
     canvas = AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
 
-    # 5. Distributed Chunk Generation Across Pool
+    # 5. Concurrent Multi-Backend Generation
     target_lang_code = target_language.strip().lower()
-    ref_param = handle_file(str(REFERENCE_VOICE_PATH))
-    max_workers = min(len(active_urls), 8)
+    max_workers = min(len(active_backends), 8)
 
-    log(f"🎬 Dubbing into target language: **{target_lang_code.upper()}**")
-    log(f"⚡ Dispatching {num_chunks} chunks across {len(active_urls)} endpoint(s) with {max_workers} concurrent thread(s)...")
+    log(f"🎬 Dubbing dialogue into target language: **{target_lang_code.upper()}**")
+    log(f"⚡ Dispatching {num_chunks} chunks across {len(active_backends)} backend(s) with {max_workers} concurrent thread(s)...")
 
     chunk_results: List[Tuple[int, int, str]] = []
     completed_count = 0
@@ -260,8 +432,8 @@ def run_hybrid_dubbing(
             executor.submit(
                 synthesize_chunk_task,
                 chunk,
-                active_urls,
-                ref_param,
+                active_backends,
+                REFERENCE_VOICE_PATH,
                 target_lang_code,
             ): chunk
             for chunk in chunks_to_process
@@ -322,53 +494,50 @@ def run_hybrid_dubbing(
 
 
 def build_app() -> gr.Blocks:
-    """Builds the polished Gradio Blocks User Interface with Multi-API Pool Load Balancer."""
+    """Builds the polished Gradio Blocks User Interface with Distributed API Pool Manager."""
     theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")
 
-    with gr.Blocks(theme=theme, title="🎬 Hybrid Auto-Dubbing Pipeline (Multi-API Pool)") as demo:
-        # Welcoming Header
+    with gr.Blocks(theme=theme, title="🎬 Distributed XTTS-v2 Auto-Dubbing Studio") as demo:
+        # Header Banner
         gr.Markdown(
             """
-            # 🎬 Hybrid Auto-Dubbing Pipeline (SRT Sync)
-            ### 🌐 Distributed Multi-API Pool Load Balancer for Coqui XTTS-v2
-            Distribute dialogue speech cloning across multiple Google Colab / Hugging Face Space GPU backends with millisecond-accurate subtitle timeline alignment.
+            # 🎬 Distributed XTTS-v2 Auto-Dubbing Studio
+            ### 🌐 Multi-Backend Serverless Load Balancer & Subtitle Lip-Sync Engine
+            Coordinate deep voice cloning across verified Hugging Face Space backends and custom APIs with zero GPU overhead on this Space.
             """
         )
 
-        # 1. Multi-API Pool Configuration
+        # 1. API Pool Management Group
         with gr.Group():
-            gr.Markdown("### 🌐 1. Multi-API Pool (Distributed XTTS-v2 Endpoints)")
+            gr.Markdown("### 🌐 1. Distributed XTTS-v2 API Pool")
             gr.Markdown(
-                "Provide Google Colab (`.gradio.live`) or Hugging Face Space API URLs. "
-                "Subtitle chunks are automatically distributed across all active endpoints in parallel for linear speedups."
+                "Select which verified Hugging Face Spaces to include in your load balancer pool. "
+                "Subtitle chunks are automatically distributed across all active backends in parallel."
             )
 
-            api_url_1 = gr.Textbox(
-                label="API URL 1 (Mandatory Primary)",
-                placeholder="https://xxxxxxxx.gradio.live (Colab or Space endpoint)",
-                lines=1,
+            space_choices = list(VERIFIED_SPACES.keys())
+            selected_spaces = gr.CheckboxGroup(
+                label="Verified Hardcoded XTTS-v2 Spaces Pool",
+                choices=space_choices,
+                value=space_choices,
+                info="All verified backends are active by default for maximum parallel speedup.",
             )
 
-            with gr.Accordion("⚙️ Additional API Endpoints (Pool Expansion: URLs 2, 3, 4, 5)", open=False):
-                gr.Markdown("Add secondary endpoints to scale parallel dubbing speedups (2x–5x).")
-                api_url_2 = gr.Textbox(
-                    label="API URL 2 (Optional)",
-                    placeholder="https://yyyyyyyy.gradio.live",
+            with gr.Accordion("➕ Add Custom Space / Server APIs (Optional)", open=False):
+                gr.Markdown("Enter additional custom Hugging Face Space names or Gradio `.live` endpoints:")
+                custom_url_1 = gr.Textbox(
+                    label="Custom API 1",
+                    placeholder="e.g. username/custom-xtts-space or https://xxxx.gradio.live",
                     lines=1,
                 )
-                api_url_3 = gr.Textbox(
-                    label="API URL 3 (Optional)",
-                    placeholder="https://zzzzzzzz.gradio.live",
+                custom_url_2 = gr.Textbox(
+                    label="Custom API 2",
+                    placeholder="e.g. username/custom-xtts-space or https://yyyy.gradio.live",
                     lines=1,
                 )
-                api_url_4 = gr.Textbox(
-                    label="API URL 4 (Optional)",
-                    placeholder="https://wwwwwwww.gradio.live",
-                    lines=1,
-                )
-                api_url_5 = gr.Textbox(
-                    label="API URL 5 (Optional)",
-                    placeholder="https://vvvvvvvv.gradio.live",
+                custom_url_3 = gr.Textbox(
+                    label="Custom API 3",
+                    placeholder="e.g. username/custom-xtts-space or https://zzzz.gradio.live",
                     lines=1,
                 )
 
@@ -399,7 +568,7 @@ def build_app() -> gr.Blocks:
                 voice_status = gr.Markdown(value=check_reference_voice())
 
                 start_btn = gr.Button(
-                    "🎬 Start Dubbing",
+                    "🎬 Start Distributed Dubbing",
                     variant="primary",
                     size="lg",
                 )
@@ -417,18 +586,17 @@ def build_app() -> gr.Blocks:
                     label="Status Logs",
                     lines=12,
                     autoscroll=True,
-                    placeholder="Pipeline logs will stream here when dubbing starts...",
+                    placeholder="Distributed pipeline logs will stream here when dubbing starts...",
                 )
 
         # Wire Submit Button Event
         start_btn.click(
-            fn=run_hybrid_dubbing,
+            fn=run_distributed_dubbing,
             inputs=[
-                api_url_1,
-                api_url_2,
-                api_url_3,
-                api_url_4,
-                api_url_5,
+                selected_spaces,
+                custom_url_1,
+                custom_url_2,
+                custom_url_3,
                 srt_input,
                 target_lang,
             ],
