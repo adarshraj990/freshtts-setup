@@ -326,54 +326,48 @@ def run_hybrid_dubbing(
 
 
 def build_app() -> gr.Blocks:
-    """Builds the Gradio Blocks User Interface."""
-    with gr.Blocks(title="Hybrid Auto-Dubbing Pipeline (SRT Sync)") as demo:
-        # Header Banner
-        with gr.Row():
-            gr.HTML(
-                """
-                <div class="header-box">
-                    <div class="header-title">🎬 Hybrid Auto-Dubbing Pipeline (SRT Sync)</div>
-                    <div style="color: #94a3b8; font-size: 1.05rem; margin-bottom: 12px;">
-                        Enterprise-Grade Anime & Video Dubbing using <b>Bhojpuri-Adapted Coqui XTTS-v2</b>, 
-                        <b>Hugging Face Space Frontend</b>, and <b>Distributed Google Colab GPU Backends</b>.
-                    </div>
-                    <div>
-                        <span class="badge">🧠 Bhojpuri-Adapted XTTS-v2</span>
-                        <span class="badge">⚖️ Round-Robin Multi-GPU Load Balancing</span>
-                        <span class="badge">⏱️ pysrt Millisecond Lip-Sync</span>
-                        <span class="badge">✂️ Pydub Timeline Stitching</span>
-                        <span class="badge">🎙️ Hardcoded Root Reference Voice</span>
-                    </div>
-                </div>
-                """
+    """Builds the polished Gradio Blocks User Interface."""
+    theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")
+
+    with gr.Blocks(theme=theme, title="🎬 Hybrid Auto-Dubbing Pipeline (SRT Sync)") as demo:
+        # Welcoming Header
+        gr.Markdown(
+            """
+            # 🎬 Hybrid Auto-Dubbing Pipeline (SRT Sync)
+            ### ⚡ High-Fidelity Multilingual Speech Cloning with Subtitle Time-Alignment
+            Orchestrate deep-learning voice dubbing using **Bhojpuri-Adapted Coqui XTTS-v2** on a Google Colab GPU backend, with millisecond-accurate timeline placement.
+            """
+        )
+
+        # 1. API Endpoints Group (URL 1 visible; URLs 2 & 3 collapsed in accordion)
+        with gr.Group():
+            gr.Markdown("### 🔗 1. Google Colab GPU Backend")
+            colab_url_1 = gr.Textbox(
+                label="Google Colab API URL 1 (Mandatory Primary)",
+                placeholder="https://xxxxxxxx.gradio.live",
+                lines=1,
+                info="Paste the public .gradio.live link from your running Colab T4 backend.",
             )
-
-        with gr.Row():
-            # LEFT COLUMN: Inputs & API Configuration
-            with gr.Column(scale=5):
-                gr.Markdown("### ⚙️ 1. Google Colab GPU API Endpoints")
+            with gr.Accordion("⚙️ Advanced: Multi-GPU Load Balancing", open=False):
                 gr.Markdown(
-                    "Launch the backend notebook in Google Colab (T4 GPU), copy the generated `https://xxxx.gradio.live` link, and paste below."
-                )
-
-                colab_url_1 = gr.Textbox(
-                    label="Google Colab API URL 1 (Mandatory Primary)",
-                    placeholder="https://xxxxxxxx.gradio.live",
-                    lines=1,
+                    "Optional: Add secondary Colab instances to enable parallel round-robin chunk processing for 2x–3x speedup."
                 )
                 colab_url_2 = gr.Textbox(
-                    label="Google Colab API URL 2 (Optional Load Balancer)",
+                    label="Google Colab API URL 2 (Optional)",
                     placeholder="https://yyyyyyyy.gradio.live (Leave blank if running 1 Colab)",
                     lines=1,
                 )
                 colab_url_3 = gr.Textbox(
-                    label="Google Colab API URL 3 (Optional Load Balancer)",
+                    label="Google Colab API URL 3 (Optional)",
                     placeholder="https://zzzzzzzz.gradio.live (Leave blank if running 1 or 2 Colabs)",
                     lines=1,
                 )
 
-                gr.Markdown("### 📄 2. Subtitles & Target Language")
+        # 2. Main Two-Column Workflow
+        with gr.Row():
+            # LEFT COLUMN: User Inputs
+            with gr.Column(scale=5):
+                gr.Markdown("### 📥 2. Subtitles & Language Configuration")
                 srt_input = gr.File(
                     label="Upload SRT Subtitle File (.srt)",
                     file_types=[".srt"],
@@ -402,7 +396,7 @@ def build_app() -> gr.Blocks:
                 )
 
             # RIGHT COLUMN: Outputs & Live Execution Logs
-            with gr.Column(scale=6):
+            with gr.Column(scale=5):
                 gr.Markdown("### 🎧 3. Dubbed Audio Master Output")
                 audio_output = gr.Audio(
                     label="Dubbed Audio Output (final_dubbed_output.wav)",
@@ -443,5 +437,6 @@ if __name__ == "__main__":
         app.launch(server_name="0.0.0.0", server_port=7860)
     except ValueError:
         app.launch()
+
 
 
