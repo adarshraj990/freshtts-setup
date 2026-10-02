@@ -48,6 +48,32 @@ try:
 except Exception:
     pass
 
+# ── Monkey-patch gradio_client schema parsing bug (bool is not iterable) ──────
+try:
+    import gradio_client.utils
+    if hasattr(gradio_client.utils, "get_type"):
+        _orig_get_type = gradio_client.utils.get_type
+        def _safe_get_type(schema):
+            if isinstance(schema, bool):
+                return "boolean"
+            if not isinstance(schema, dict):
+                return "any"
+            return _orig_get_type(schema)
+        gradio_client.utils.get_type = _safe_get_type
+
+    if hasattr(gradio_client.utils, "_json_schema_to_python_type"):
+        _orig_schema_to_type = gradio_client.utils._json_schema_to_python_type
+        def _safe_schema_to_type(schema, defs):
+            if isinstance(schema, bool):
+                return "bool"
+            try:
+                return _orig_schema_to_type(schema, defs)
+            except Exception:
+                return "Any"
+        gradio_client.utils._json_schema_to_python_type = _safe_schema_to_type
+except Exception:
+    pass
+
 import gradio as gr
 from gradio_client import Client
 try:
@@ -413,5 +439,9 @@ def build_app() -> gr.Blocks:
 app = build_app()
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    try:
+        app.launch(server_name="0.0.0.0", server_port=7860)
+    except ValueError:
+        app.launch()
+
 
