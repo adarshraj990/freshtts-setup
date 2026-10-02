@@ -79,15 +79,14 @@ To solve this systematically, the pipeline is decoupled into two independent, pu
   $$\text{Canvas Duration} = \text{last\_sub.end.ordinal} + 2000\text{ ms buffer}$$
 - **Overlay**: Synthesized `.wav` chunks are layered on top of the silent canvas at their exact visual onset using `pydub.AudioSegment.overlay(position=start_time_ms)`.
 
-#### 3.3 Round-Robin Load Balancing (Up to 3 Colab URLs)
-- **Specification**: The frontend provides 3 API URL inputs:
-  - `URL 1`: Mandatory primary Colab endpoint.
-  - `URL 2`: Optional secondary Colab endpoint.
-  - `URL 3`: Optional tertiary Colab endpoint.
-- **Dispatch Algorithm**:
-  $$\text{Assigned Endpoint} = \text{ActiveURLs}[i \pmod{N}]$$
-  where $i$ is the subtitle index ($0, 1, 2, \dots$) and $N$ is the number of active URLs provided ($1 \le N \le 3$).
-- **Network Resilience**: If a call times out or encounters network jitter, the client logs the warning and automatically retries the chunk on an alternate available worker.
+#### 3.3 Multi-API Pool Load Balancing (Up to 5 Endpoints)
+- **Specification**: The frontend provides a scalable API pool supporting up to 5 distributed endpoints:
+  - `API URL 1`: Mandatory primary endpoint (Colab or Space).
+  - `API URLs 2–5`: Optional pool expansion endpoints.
+- **Concurrent Dispatch Architecture**:
+  Utilizes a thread pool (`ThreadPoolExecutor(max_workers=min(len(active_urls), 8))`) to dispatch chunks in parallel across all active backends, achieving $2\times$ to $5\times$ linear dubbing speedups.
+- **Failover Resilience**: If an endpoint times out or fails on a chunk, the orchestrator automatically re-dispatches the chunk to alternate workers in the pool.
+- **Strict Chronological Assembly**: Synthesized chunks are tracked by their subtitle index and reconstructed sequentially onto the Pydub master canvas at their exact visual onsets.
 
 ---
 
