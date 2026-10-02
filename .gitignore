@@ -21,6 +21,7 @@ outputs/*
 unit_test_*.wav
 final_dubbed_output.wav
 *.wav
+!reference_voice.wav
 *.mp3
 
 # Virtual environments
