@@ -16,6 +16,38 @@ from pathlib import Path
 import time
 from typing import Dict, List, Optional, Tuple
 
+# ── Monkey-patch missing HfFolder for huggingface_hub >= 0.23.0 compatibility ──
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "HfFolder"):
+        class HfFolder:
+            path_token = None
+
+            @classmethod
+            def get_token(cls):
+                try:
+                    return huggingface_hub.get_token()
+                except Exception:
+                    return None
+
+            @classmethod
+            def save_token(cls, token):
+                try:
+                    huggingface_hub.login(token=token)
+                except Exception:
+                    pass
+
+            @classmethod
+            def delete_token(cls):
+                try:
+                    huggingface_hub.logout()
+                except Exception:
+                    pass
+
+        huggingface_hub.HfFolder = HfFolder
+except Exception:
+    pass
+
 import gradio as gr
 from gradio_client import Client
 try:
