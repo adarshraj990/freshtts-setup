@@ -1,14 +1,4 @@
-TTS==0.22.0
 gradio==4.40.0
-spaces
-torch
-torchaudio
-soundfile
-scipy
-numpy
-librosa
-setuptools<70.0.0
+gradio_client==1.2.0
 pysrt
 pydub
-gradio_client==0.6.1
-huggingface_hub<0.23.0
