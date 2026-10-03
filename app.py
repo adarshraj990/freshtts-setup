@@ -1,24 +1,50 @@
 """
 🎬 Distributed Hybrid Auto-Dubbing Pipeline (SRT Sync)
-Hugging Face Space Frontend Orchestrator & Multi-Backend Load Balancer
+Hugging Face Space Frontend Orchestrator & Multi-Backend Sequential Queue
 
 Features:
 - Exclusive Manager Role: 100% serverless coordinator. Zero local XTTS generation.
+- Startup Wake-Up Ping (Warm-Up): Sends lightweight asynchronous background test requests to all hardcoded spaces on startup to wake sleeping GPU instances.
 - Hardcoded Verified API Pool: Pre-configured with 6 verified Hugging Face XTTS-v2 spaces.
-- Manual Backend Extension: Custom Space / Gradio API endpoints can be added dynamically.
-- Parallel Multi-Backend Dispatch: Concurrent round-robin distribution with automated failover retry.
+- Strict Sequential Batch Queue: 1-by-1 wait-for-response dispatch with rotation and automated failover. Zero parallel chunk bursts to prevent rate limits or dropped requests.
 - Precise Lip-Sync Timing: Millisecond-accurate timeline placement via pysrt.
 - Chronological Audio Stitching: Seamless master canvas overlay using Pydub.
 - Root Reference Voice: Automatically utilizes `reference_voice.wav` from the root directory.
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+# Reconfigure stdout/stderr for Unicode safety across Windows and Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def safe_print(*args, **kwargs):
+    """Safely prints to stdout without raising UnicodeEncodeError on cp1252/ascii terminals."""
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        try:
+            safe_args = [str(a).encode("ascii", "replace").decode("ascii") for a in args]
+            print(*safe_args, **kwargs)
+        except Exception:
+            pass
+
 
 # ── Monkey-patch missing HfFolder for huggingface_hub >= 0.23.0 compatibility ──
 try:
@@ -132,6 +158,12 @@ VERIFIED_SPACES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Backend Warm-up Status Tracking
+WARMUP_STATUS: Dict[str, str] = {
+    space_id: "Warming up... ⏳" for space_id in VERIFIED_SPACES
+}
+WARMUP_LOCK = threading.Lock()
+
 
 def check_reference_voice() -> str:
     """Verifies that reference_voice.wav is present in the root directory."""
@@ -148,6 +180,14 @@ def get_or_create_client(endpoint_or_url: str) -> Client:
         if clean_target not in CLIENT_CACHE:
             CLIENT_CACHE[clean_target] = Client(clean_target)
         return CLIENT_CACHE[clean_target]
+
+
+def reset_client(endpoint_or_url: str):
+    """Purges a client from the cache so any dead connection is cleanly re-established."""
+    clean_target = endpoint_or_url.strip().rstrip("/")
+    with CLIENT_CACHE_LOCK:
+        if clean_target in CLIENT_CACHE:
+            del CLIENT_CACHE[clean_target]
 
 
 def extract_audio_path(res: Any) -> Optional[str]:
@@ -229,6 +269,7 @@ def execute_backend_call(
             "fr": "French",
             "es": "Spanish",
             "pt": "Portuguese",
+            "en": "English",
         }
         lang_name = lang_name_map.get(lang_key, "English")
         result = client.predict(
@@ -275,37 +316,83 @@ def execute_backend_call(
             return extract_audio_path(res)
 
 
-def synthesize_chunk_task(
-    chunk_tuple: Tuple[int, int, int, str],
-    active_backends: List[Dict[str, Any]],
+def execute_backend_call_with_timeout(
+    backend_info: Dict[str, Any],
+    text: str,
     ref_path: Path,
-    target_lang_code: str,
-) -> Tuple[int, int, Optional[str], Optional[str], str]:
+    lang_key: str,
+    timeout_seconds: int = 90,
+) -> Optional[str]:
     """
-    Dispatches a single subtitle dialogue chunk across the active backend pool
-    with round-robin priority and automated failover retry.
+    Executes a single backend call with a strict timeout to prevent hung requests.
+    Automatically resets the client cache entry if an error or timeout occurs.
     """
-    chunk_idx, start_time_ms, end_time_ms, chunk_text = chunk_tuple
-
-    # Round-robin initial worker assignment
-    primary_idx = (chunk_idx - 1) % len(active_backends)
-    ordered_backends = [active_backends[primary_idx]] + [
-        b for i, b in enumerate(active_backends) if i != primary_idx
-    ]
-
-    last_error = None
-    for attempt, b_info in enumerate(ordered_backends, start=1):
-        target_name = b_info["name"]
+    target = backend_info["target"]
+    with ThreadPoolExecutor(max_workers=1) as single_executor:
+        future = single_executor.submit(
+            execute_backend_call, backend_info, text, ref_path, lang_key
+        )
         try:
-            audio_path = execute_backend_call(b_info, chunk_text, ref_path, target_lang_code)
-            if audio_path and os.path.exists(audio_path):
-                return chunk_idx, start_time_ms, audio_path, None, target_name
-        except Exception as e:
-            last_error = f"{target_name}: {e}"
-            time.sleep(0.5)
+            return future.result(timeout=timeout_seconds)
+        except Exception:
+            reset_client(target)
+            raise
 
-    return chunk_idx, start_time_ms, None, last_error or "All backends failed", "None"
 
+# ── Startup Wake-Up Ping (Warm-Up Mechanism) ──────────────────────────────────
+
+def ping_single_backend(space_id: str, b_info: Dict[str, Any]):
+    """Sends a lightweight asynchronous test word 'Test' to wake up a sleeping space."""
+    try:
+        with WARMUP_LOCK:
+            WARMUP_STATUS[space_id] = "Warming up... ⏳"
+        safe_print(f"🔥 [Startup Warm-Up] Sending wake-up ping to {space_id}...")
+        meta = dict(b_info)
+        meta["target"] = space_id
+        audio_path = execute_backend_call_with_timeout(
+            meta,
+            text="Test",
+            ref_path=REFERENCE_VOICE_PATH,
+            lang_key="en",
+            timeout_seconds=90,
+        )
+        if audio_path and os.path.exists(audio_path):
+            with WARMUP_LOCK:
+                WARMUP_STATUS[space_id] = "Ready 🟢"
+            safe_print(f"✅ [Startup Warm-Up] {space_id} is warm and ready!")
+        else:
+            with WARMUP_LOCK:
+                WARMUP_STATUS[space_id] = "Standby / Awakening 🟡"
+            safe_print(f"🟡 [Startup Warm-Up] {space_id} ping returned without audio path (Standby).")
+    except Exception as e:
+        err_snippet = str(e).replace("\n", " ")[:35]
+        with WARMUP_LOCK:
+            WARMUP_STATUS[space_id] = f"Sleep / Retrying 🔴 ({err_snippet})"
+        safe_print(f"⚠️ [Startup Warm-Up] Ping to {space_id} failed: {e}")
+
+
+def run_startup_warmup_all():
+    """Fires parallel lightweight wake-up pings to all 6 hardcoded spaces in the background."""
+    safe_print("🚀 [Startup Warm-Up] Waking up all verified Hugging Face Spaces in background...")
+    for space_id, b_info in VERIFIED_SPACES.items():
+        t = threading.Thread(target=ping_single_backend, args=(space_id, b_info), daemon=True)
+        t.start()
+
+
+def get_warmup_status_markdown() -> str:
+    """Renders a clean Markdown table of the current warm-up status of all backends."""
+    lines = [
+        "| Verified Space | Endpoint | Warm-Up Status |",
+        "| :--- | :--- | :--- |",
+    ]
+    with WARMUP_LOCK:
+        for space_id, info in VERIFIED_SPACES.items():
+            status = WARMUP_STATUS.get(space_id, "Pending ⏳")
+            lines.append(f"| `{space_id}` | `{info['endpoint']}` | **{status}** |")
+    return "\n".join(lines)
+
+
+# ── Distributed Auto-Dubbing Engine (Strict Sequential Queue) ──────────────────
 
 def run_distributed_dubbing(
     selected_spaces: List[str],
@@ -321,7 +408,11 @@ def run_distributed_dubbing(
     1. Gathers all selected hardcoded Spaces and custom manual endpoints.
     2. Verifies the root reference_voice.wav file.
     3. Parses SRT subtitles using pysrt.
-    4. Distributes generation requests concurrently across all available backends.
+    4. Executes a STRICT SEQUENTIAL BATCH QUEUE:
+       - Sends Chunk 1 to an available backend in rotation.
+       - WAITS until it successfully returns the audio chunk.
+       - ONLY THEN dispatches Chunk 2 to the next backend in rotation.
+       - Falls back automatically to the next backend if a backend fails.
     5. Reassembles synthesized audio chunks in strictly chronological order.
     6. Stitches onto a Pydub silent canvas and exports final_dubbed_output.wav.
     """
@@ -333,7 +424,7 @@ def run_distributed_dubbing(
         entry = f"[{timestamp}] {msg}"
         with log_lock:
             logs.append(entry)
-        print(entry)
+        safe_print(entry)
 
     start_time = time.time()
     log("🚀 Initializing Distributed Multi-Backend Auto-Dubbing Manager...")
@@ -417,49 +508,71 @@ def run_distributed_dubbing(
     log("🎼 Initializing silent master canvas with Pydub (24,000 Hz, Mono)...")
     canvas = AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
 
-    # 5. Concurrent Multi-Backend Generation
+    # 5. Strict Sequential Batch Queue (Wait-For-Response)
     target_lang_code = target_language.strip().lower()
-    max_workers = min(len(active_backends), 8)
+    num_backends = len(active_backends)
+    backend_rot_idx = 0
 
     log(f"🎬 Dubbing dialogue into target language: **{target_lang_code.upper()}**")
-    log(f"⚡ Dispatching {num_chunks} chunks across {len(active_backends)} backend(s) with {max_workers} concurrent thread(s)...")
+    log("🔄 Mode: **Strict Sequential Queue** (1-by-1 wait-for-response, zero concurrent collisions)")
+    log(f"⚡ Queueing {num_chunks} chunks across {num_backends} active backend(s)...")
 
     chunk_results: List[Tuple[int, int, str]] = []
-    completed_count = 0
+    successful_chunks = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_chunk = {
-            executor.submit(
-                synthesize_chunk_task,
-                chunk,
-                active_backends,
-                REFERENCE_VOICE_PATH,
-                target_lang_code,
-            ): chunk
-            for chunk in chunks_to_process
-        }
+    for idx, (chunk_idx, start_time_ms, end_time_ms, chunk_text) in enumerate(chunks_to_process, start=1):
+        progress_val = (idx - 1) / num_chunks
+        progress(progress_val, desc=f"Sequential Queue: Chunk [{idx}/{num_chunks}] (Waiting for response...)")
 
-        for future in as_completed(future_to_chunk):
-            chunk_idx, start_time_ms, audio_path, err, worker_used = future.result()
-            completed_count += 1
-            progress_ratio = completed_count / num_chunks
-            progress(
-                progress_ratio,
-                desc=f"Synthesizing [{completed_count}/{num_chunks}] across API pool...",
-            )
+        start_rot = backend_rot_idx
+        chunk_success = False
+        last_error = None
 
-            if audio_path and os.path.exists(audio_path):
-                log(f"✅ Chunk #{chunk_idx} completed by {worker_used}")
-                chunk_results.append((chunk_idx, start_time_ms, audio_path))
-            else:
-                log(f"❌ Chunk #{chunk_idx} failed across available pool: {err}")
+        # Sequential retry loop across available backends for this chunk
+        for attempt in range(num_backends):
+            curr_backend_idx = (start_rot + attempt) % num_backends
+            b_info = active_backends[curr_backend_idx]
+            target_name = b_info["name"]
+
+            log(f"⏳ [Chunk #{chunk_idx}/{num_chunks}] Dispatching to '{target_name}' (Waiting for audio response)...")
+            call_start = time.time()
+            try:
+                audio_path = execute_backend_call_with_timeout(
+                    b_info,
+                    chunk_text,
+                    REFERENCE_VOICE_PATH,
+                    target_lang_code,
+                    timeout_seconds=90,
+                )
+                call_dur = time.time() - call_start
+                if audio_path and os.path.exists(audio_path):
+                    log(f"✅ [Chunk #{chunk_idx}/{num_chunks}] Completed by '{target_name}' in {call_dur:.2f}s.")
+                    chunk_results.append((chunk_idx, start_time_ms, audio_path))
+                    chunk_success = True
+                    successful_chunks += 1
+                    # Advance rotation pointer so the next chunk goes to the next backend
+                    backend_rot_idx = (curr_backend_idx + 1) % num_backends
+                    break
+                else:
+                    log(f"⚠️ [Chunk #{chunk_idx}/{num_chunks}] '{target_name}' returned no audio ({call_dur:.2f}s). Retrying next backend...")
+            except Exception as e:
+                call_dur = time.time() - call_start
+                last_error = str(e).replace("\n", " ")
+                log(f"⚠️ [Chunk #{chunk_idx}/{num_chunks}] '{target_name}' error ({call_dur:.2f}s): {last_error}. Retrying next backend...")
+                time.sleep(0.5)
+
+        if not chunk_success:
+            log(f"❌ [Chunk #{chunk_idx}/{num_chunks}] Failed across all {num_backends} backends: {last_error}")
+            # Advance rotation pointer anyway so we don't start on a failing backend for the next chunk
+            backend_rot_idx = (start_rot + 1) % num_backends
+
+        progress(idx / num_chunks, desc=f"Sequential Queue: Chunk [{idx}/{num_chunks}] complete")
 
     # 6. Assembly: Chronological Stitching onto Master Canvas
     progress(0.95, desc="Stitching audio chunks into master track...")
     chunk_results.sort(key=lambda x: x[0])  # Guarantee exact chronological order
     log(f"🎼 Assembling {len(chunk_results)} generated chunks onto master timeline canvas...")
 
-    successful_chunks = 0
     for chunk_idx, start_time_ms, audio_path in chunk_results:
         try:
             chunk_audio = AudioSegment.from_file(audio_path)
@@ -471,7 +584,6 @@ def run_distributed_dubbing(
                 chunk_audio = chunk_audio.fade_in(15).fade_out(15)
 
             canvas = canvas.overlay(chunk_audio, position=start_time_ms)
-            successful_chunks += 1
         except Exception as e:
             log(f"⚠️ Error overlaying Chunk #{chunk_idx}: {e}")
 
@@ -493,8 +605,10 @@ def run_distributed_dubbing(
         raise gr.Error(err_msg)
 
 
+# ── Gradio Blocks User Interface ──────────────────────────────────────────────
+
 def build_app() -> gr.Blocks:
-    """Builds the polished Gradio Blocks User Interface with Distributed API Pool Manager."""
+    """Builds the polished Gradio Blocks User Interface with Sequential Queue & Warm-Up Manager."""
     theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")
 
     with gr.Blocks(theme=theme, title="🎬 Distributed XTTS-v2 Auto-Dubbing Studio") as demo:
@@ -502,8 +616,8 @@ def build_app() -> gr.Blocks:
         gr.Markdown(
             """
             # 🎬 Distributed XTTS-v2 Auto-Dubbing Studio
-            ### 🌐 Multi-Backend Serverless Load Balancer & Subtitle Lip-Sync Engine
-            Coordinate deep voice cloning across verified Hugging Face Space backends and custom APIs with zero GPU overhead on this Space.
+            ### 🌐 Multi-Backend Sequential Queue & Startup Warm-Up Orchestrator
+            Coordinate deep voice cloning across verified Hugging Face Space backends with zero local GPU load.
             """
         )
 
@@ -511,16 +625,21 @@ def build_app() -> gr.Blocks:
         with gr.Group():
             gr.Markdown("### 🌐 1. Distributed XTTS-v2 API Pool")
             gr.Markdown(
-                "Select which verified Hugging Face Spaces to include in your load balancer pool. "
-                "Subtitle chunks are automatically distributed across all active backends in parallel."
+                "All external spaces are automatically pinged on startup to wake their models from sleep. "
+                "Subtitle chunks are processed in a **strict sequential queue** (1-by-1 wait-for-response) "
+                "with automated failover and round-robin load distribution."
             )
+
+            with gr.Accordion("⚡ Backend Startup Warm-Up Status & Health", open=True):
+                warmup_status_md = gr.Markdown(value=get_warmup_status_markdown())
+                refresh_warmup_btn = gr.Button("🔄 Re-Ping & Refresh Warm-Up Status", size="sm")
 
             space_choices = list(VERIFIED_SPACES.keys())
             selected_spaces = gr.CheckboxGroup(
                 label="Verified Hardcoded XTTS-v2 Spaces Pool",
                 choices=space_choices,
                 value=space_choices,
-                info="All verified backends are active by default for maximum parallel speedup.",
+                info="All verified backends are active by default for rotation and failover.",
             )
 
             with gr.Accordion("➕ Add Custom Space / Server APIs (Optional)", open=False):
@@ -568,7 +687,7 @@ def build_app() -> gr.Blocks:
                 voice_status = gr.Markdown(value=check_reference_voice())
 
                 start_btn = gr.Button(
-                    "🎬 Start Distributed Dubbing",
+                    "🎬 Start Sequential Dubbing",
                     variant="primary",
                     size="lg",
                 )
@@ -586,8 +705,20 @@ def build_app() -> gr.Blocks:
                     label="Status Logs",
                     lines=12,
                     autoscroll=True,
-                    placeholder="Distributed pipeline logs will stream here when dubbing starts...",
+                    placeholder="Sequential pipeline logs will stream here when dubbing starts...",
                 )
+
+        # Wire Warm-Up Refresh Button Event
+        def on_refresh_warmup():
+            run_startup_warmup_all()
+            time.sleep(1.0)
+            return get_warmup_status_markdown()
+
+        refresh_warmup_btn.click(
+            fn=on_refresh_warmup,
+            inputs=[],
+            outputs=[warmup_status_md],
+        )
 
         # Wire Submit Button Event
         start_btn.click(
@@ -608,6 +739,9 @@ def build_app() -> gr.Blocks:
 
     return demo
 
+
+# Automatically initiate lightweight background wake-up pings to all hardcoded spaces on startup
+threading.Thread(target=run_startup_warmup_all, daemon=True).start()
 
 app = build_app()
 
