@@ -1,12 +1,23 @@
 """
 🎬 Distributed Hybrid Auto-Dubbing Pipeline (SRT Sync)
-Hugging Face Space Frontend Orchestrator & Multi-Backend Sequential Queue
+Hugging Face Space Frontend Orchestrator & Ultra-Robust Multi-Backend Sequential Queue
 
 Features:
 - Exclusive Manager Role: 100% serverless coordinator. Zero local XTTS generation.
-- Startup Wake-Up Ping (Warm-Up): Sends lightweight asynchronous background test requests to all hardcoded spaces on startup to wake sleeping GPU instances.
-- Hardcoded Verified API Pool: Pre-configured with 6 verified Hugging Face XTTS-v2 spaces.
-- Strict Sequential Batch Queue: 1-by-1 wait-for-response dispatch with rotation and automated failover. Zero parallel chunk bursts to prevent rate limits or dropped requests.
+- Curated Verified Active Pool (11 Spaces):
+  1. hasanbasbunar/Voice-Cloning-XTTS-v2 (/voice_clone_synthesis)
+  2. Aviranjanprasad/Bhojpuri-XTTS-API (/synthesize_speech)
+  3. yasirs/XTTS-V2 (/voice_clone_synthesis)
+  4. ama605/Russian-Voice-Cloning-XTTS-v2 (/voice_clone_synthesis)
+  5. YemenEdu/Voice-Cloning-XTTS-v2 (/voice_clone_synthesis)
+  6. minsus/Voice-Cloning-XTTS-v2 (/voice_clone_synthesis)
+  7. tungpcco/XTTS-v2 (/voice_clone_synthesis)
+  8. TGPro1/XTTS-v2 (/clone_voice)
+  9. Fatimamirza970/Voice-Cloning-XTTS-v2 (/voice_clone_synthesis)
+  10. applore/xtts-voice-cloning-demo (/predict)
+  11. eagien/XTTS (/predict)
+- Startup Health Check & Wake-Up Ping: Non-blocking background health check automatically wakes sleeping spaces and filters out dead, sleeping, or quota-exceeded spaces, retaining only responsive backends in active rotation.
+- Strict Sequential Batch Queue: Strict 1-by-1 wait-for-response dispatch with round-robin rotation and dynamic failover. Zero concurrent collisions or queue drops.
 - Precise Lip-Sync Timing: Millisecond-accurate timeline placement via pysrt.
 - Chronological Audio Stitching: Seamless master canvas overlay using Pydub.
 - Root Reference Voice: Automatically utilizes `reference_voice.wav` from the root directory.
@@ -19,7 +30,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Reconfigure stdout/stderr for Unicode safety across Windows and Linux
 if hasattr(sys.stdout, "reconfigure"):
@@ -124,43 +135,71 @@ OUTPUT_AUDIO_PATH = BASE_DIR / "final_dubbed_output.wav"
 CLIENT_CACHE: Dict[str, Client] = {}
 CLIENT_CACHE_LOCK = threading.Lock()
 
-# Verified Hardcoded Hugging Face XTTS-v2 Spaces Pool
+# Curated Verified Active XTTS-v2 Spaces Pool (11 Verified Spaces)
 VERIFIED_SPACES: Dict[str, Dict[str, Any]] = {
-    "Aviranjanprasad/Bhojpuri-XTTS-API": {
-        "name": "Aviranjanprasad/Bhojpuri-XTTS-API",
-        "endpoint": "/synthesize_speech",
-        "type": "bhojpuri",
-    },
     "hasanbasbunar/Voice-Cloning-XTTS-v2": {
         "name": "hasanbasbunar/Voice-Cloning-XTTS-v2",
         "endpoint": "/voice_clone_synthesis",
         "type": "hasanbasbunar",
     },
-    "eagien/XTTS": {
-        "name": "eagien/XTTS",
-        "endpoint": "/predict",
-        "type": "eagien",
+    "Aviranjanprasad/Bhojpuri-XTTS-API": {
+        "name": "Aviranjanprasad/Bhojpuri-XTTS-API",
+        "endpoint": "/synthesize_speech",
+        "type": "bhojpuri",
+    },
+    "yasirs/XTTS-V2": {
+        "name": "yasirs/XTTS-V2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "ama605/Russian-Voice-Cloning-XTTS-v2": {
+        "name": "ama605/Russian-Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "YemenEdu/Voice-Cloning-XTTS-v2": {
+        "name": "YemenEdu/Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "minsus/Voice-Cloning-XTTS-v2": {
+        "name": "minsus/Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "tungpcco/XTTS-v2": {
+        "name": "tungpcco/XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
+    },
+    "TGPro1/XTTS-v2": {
+        "name": "TGPro1/XTTS-v2",
+        "endpoint": "/clone_voice",
+        "type": "tgpro",
+    },
+    "Fatimamirza970/Voice-Cloning-XTTS-v2": {
+        "name": "Fatimamirza970/Voice-Cloning-XTTS-v2",
+        "endpoint": "/voice_clone_synthesis",
+        "type": "hasanbasbunar",
     },
     "applore/xtts-voice-cloning-demo": {
         "name": "applore/xtts-voice-cloning-demo",
         "endpoint": "/predict",
         "type": "applore",
     },
-    "Fatimamirza970/Voice-Cloning-XTTS-V2": {
-        "name": "Fatimamirza970/Voice-Cloning-XTTS-V2",
-        "endpoint": "/voice_clone_synthesis",
-        "type": "hasanbasbunar",
-    },
-    "JymNils/Voice-Cloning-XTTS-v2": {
-        "name": "JymNils/Voice-Cloning-XTTS-v2",
-        "endpoint": "/voice_clone_synthesis",
-        "type": "hasanbasbunar",
+    "eagien/XTTS": {
+        "name": "eagien/XTTS",
+        "endpoint": "/predict",
+        "type": "eagien",
     },
 }
 
-# Backend Warm-up Status Tracking
+# Dynamic Runtime Health & Warm-Up Tracking
+HEALTHY_BACKENDS: Set[str] = set()
+HEALTHY_BACKENDS_LOCK = threading.Lock()
+
 WARMUP_STATUS: Dict[str, str] = {
-    space_id: "Warming up... ⏳" for space_id in VERIFIED_SPACES
+    space_id: "Health check pending... ⏳" for space_id in VERIFIED_SPACES
 }
 WARMUP_LOCK = threading.Lock()
 
@@ -261,7 +300,23 @@ def execute_backend_call(
         )
         return extract_audio_path(result)
 
-    # 4. Hasanbasbunar / Fatimamirza970 / JymNils
+    # 4. TGPro1 XTTS
+    elif b_type == "tgpro":
+        # /clone_voice(text, language, reference_audio) -> generated_speech
+        tg_supported = [
+            "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru",
+            "nl", "cs", "ar", "zh-cn", "ja", "ko", "hu"
+        ]
+        lang = lang_key if lang_key in tg_supported else "en"
+        result = client.predict(
+            text=text,
+            language=lang,
+            reference_audio=ref_param,
+            api_name="/clone_voice",
+        )
+        return extract_audio_path(result)
+
+    # 5. Hasanbasbunar / Yasirs / ama605 / YemenEdu / Minsus / Tungpcco / Fatimamirza
     elif b_type == "hasanbasbunar":
         # /voice_clone_synthesis uses full language names
         lang_name_map = {
@@ -270,6 +325,12 @@ def execute_backend_call(
             "es": "Spanish",
             "pt": "Portuguese",
             "en": "English",
+            "ru": "Russian",
+            "ar": "Arabic",
+            "de": "German",
+            "it": "Italian",
+            "ja": "Japanese",
+            "zh": "Chinese",
         }
         lang_name = lang_name_map.get(lang_key, "English")
         result = client.predict(
@@ -296,7 +357,7 @@ def execute_backend_call(
         )
         return extract_audio_path(result)
 
-    # 5. Custom / Generic Backend
+    # 6. Custom / Generic Backend
     else:
         try:
             res = client.predict(
@@ -321,7 +382,7 @@ def execute_backend_call_with_timeout(
     text: str,
     ref_path: Path,
     lang_key: str,
-    timeout_seconds: int = 90,
+    timeout_seconds: int = 75,
 ) -> Optional[str]:
     """
     Executes a single backend call with a strict timeout to prevent hung requests.
@@ -339,14 +400,17 @@ def execute_backend_call_with_timeout(
             raise
 
 
-# ── Startup Wake-Up Ping (Warm-Up Mechanism) ──────────────────────────────────
+# ── Startup Health Check & Wake-Up Ping Mechanism ─────────────────────────────
 
 def ping_single_backend(space_id: str, b_info: Dict[str, Any]):
-    """Sends a lightweight asynchronous test word 'Test' to wake up a sleeping space."""
+    """
+    Sends a lightweight test request ('Test') to wake up a sleeping space.
+    Automatically flags the space as healthy in HEALTHY_BACKENDS if responsive.
+    """
     try:
         with WARMUP_LOCK:
-            WARMUP_STATUS[space_id] = "Warming up... ⏳"
-        safe_print(f"🔥 [Startup Warm-Up] Sending wake-up ping to {space_id}...")
+            WARMUP_STATUS[space_id] = "Pinging / Checking... ⏳"
+        safe_print(f"🔥 [Startup Health Check] Testing {space_id}...")
         meta = dict(b_info)
         meta["target"] = space_id
         audio_path = execute_backend_call_with_timeout(
@@ -354,41 +418,49 @@ def ping_single_backend(space_id: str, b_info: Dict[str, Any]):
             text="Test",
             ref_path=REFERENCE_VOICE_PATH,
             lang_key="en",
-            timeout_seconds=90,
+            timeout_seconds=60,
         )
         if audio_path and os.path.exists(audio_path):
             with WARMUP_LOCK:
-                WARMUP_STATUS[space_id] = "Ready 🟢"
-            safe_print(f"✅ [Startup Warm-Up] {space_id} is warm and ready!")
+                WARMUP_STATUS[space_id] = "Ready 🟢 (Active in Pool)"
+            with HEALTHY_BACKENDS_LOCK:
+                HEALTHY_BACKENDS.add(space_id)
+            safe_print(f"✅ [Startup Health Check] {space_id} is healthy! Added to active rotation.")
         else:
             with WARMUP_LOCK:
                 WARMUP_STATUS[space_id] = "Standby / Awakening 🟡"
-            safe_print(f"🟡 [Startup Warm-Up] {space_id} ping returned without audio path (Standby).")
+            with HEALTHY_BACKENDS_LOCK:
+                HEALTHY_BACKENDS.discard(space_id)
+            safe_print(f"🟡 [Startup Health Check] {space_id} returned no audio. Filtered out of active pool.")
     except Exception as e:
         err_snippet = str(e).replace("\n", " ")[:35]
         with WARMUP_LOCK:
-            WARMUP_STATUS[space_id] = f"Sleep / Retrying 🔴 ({err_snippet})"
-        safe_print(f"⚠️ [Startup Warm-Up] Ping to {space_id} failed: {e}")
+            WARMUP_STATUS[space_id] = f"Inactive/Sleep 🔴 ({err_snippet})"
+        with HEALTHY_BACKENDS_LOCK:
+            HEALTHY_BACKENDS.discard(space_id)
+        safe_print(f"⚠️ [Startup Health Check] {space_id} failed: {err_snippet}")
 
 
 def run_startup_warmup_all():
-    """Fires parallel lightweight wake-up pings to all 6 hardcoded spaces in the background."""
-    safe_print("🚀 [Startup Warm-Up] Waking up all verified Hugging Face Spaces in background...")
+    """Fires parallel lightweight wake-up health pings to all 11 hardcoded spaces in the background."""
+    safe_print("🚀 [Startup Health Check] Initiating health checks across all 11 XTTS-v2 spaces...")
     for space_id, b_info in VERIFIED_SPACES.items():
         t = threading.Thread(target=ping_single_backend, args=(space_id, b_info), daemon=True)
         t.start()
 
 
 def get_warmup_status_markdown() -> str:
-    """Renders a clean Markdown table of the current warm-up status of all backends."""
+    """Renders a clean Markdown table of the current health and warm-up status of all backends."""
     lines = [
-        "| Verified Space | Endpoint | Warm-Up Status |",
-        "| :--- | :--- | :--- |",
+        "| Verified Space | Endpoint | Health & Warm-Up Status | Active in Pool |",
+        "| :--- | :--- | :--- | :---: |",
     ]
     with WARMUP_LOCK:
         for space_id, info in VERIFIED_SPACES.items():
             status = WARMUP_STATUS.get(space_id, "Pending ⏳")
-            lines.append(f"| `{space_id}` | `{info['endpoint']}` | **{status}** |")
+            with HEALTHY_BACKENDS_LOCK:
+                is_active = "✅ Yes" if space_id in HEALTHY_BACKENDS else "❌ No"
+            lines.append(f"| `{space_id}` | `{info['endpoint']}` | **{status}** | {is_active} |")
     return "\n".join(lines)
 
 
@@ -405,14 +477,14 @@ def run_distributed_dubbing(
 ) -> Tuple[Optional[str], str]:
     """
     Distributed Multi-Backend Auto-Dubbing Manager:
-    1. Gathers all selected hardcoded Spaces and custom manual endpoints.
-    2. Verifies the root reference_voice.wav file.
-    3. Parses SRT subtitles using pysrt.
+    1. Gathers responsive spaces from the active health check pool.
+    2. Automatically filters out dead, sleeping, or quota-exceeded spaces.
+    3. Parses SRT subtitles into dialogue chunks.
     4. Executes a STRICT SEQUENTIAL BATCH QUEUE:
-       - Sends Chunk 1 to an available backend in rotation.
+       - Sends Chunk 1 to an available healthy backend in rotation.
        - WAITS until it successfully returns the audio chunk.
-       - ONLY THEN dispatches Chunk 2 to the next backend in rotation.
-       - Falls back automatically to the next backend if a backend fails.
+       - ONLY THEN dispatches Chunk 2 to the next healthy backend in rotation.
+       - Gracefully falls back to the next healthy backend if a failure occurs.
     5. Reassembles synthesized audio chunks in strictly chronological order.
     6. Stitches onto a Pydub silent canvas and exports final_dubbed_output.wav.
     """
@@ -427,7 +499,7 @@ def run_distributed_dubbing(
         safe_print(entry)
 
     start_time = time.time()
-    log("🚀 Initializing Distributed Multi-Backend Auto-Dubbing Manager...")
+    log("🚀 Initializing Ultra-Robust Multi-Backend Auto-Dubbing Manager...")
 
     # 1. Verify root reference voice
     if not REFERENCE_VOICE_PATH.is_file():
@@ -440,18 +512,34 @@ def run_distributed_dubbing(
 
     log(f"🎙️ Active Reference Voice: `{REFERENCE_VOICE_PATH.name}` ({REFERENCE_VOICE_PATH.stat().st_size / (1024*1024):.2f} MB)")
 
-    # 2. Build the Active Backend Pool
+    # 2. Build the Active Backend Pool with Health Filtering
     active_backends: List[Dict[str, Any]] = []
 
-    # Add selected hardcoded spaces
-    if selected_spaces:
-        for space_id in selected_spaces:
-            if space_id in VERIFIED_SPACES:
-                meta = dict(VERIFIED_SPACES[space_id])
-                meta["target"] = space_id
-                active_backends.append(meta)
+    with HEALTHY_BACKENDS_LOCK:
+        healthy_set = set(HEALTHY_BACKENDS)
 
-    # Add custom manual endpoints
+    active_selected_spaces: List[str] = []
+    if selected_spaces:
+        # Filter: retain responsive spaces verified by startup health check
+        healthy_selected = [s for s in selected_spaces if s in healthy_set]
+        if healthy_selected:
+            active_selected_spaces = healthy_selected
+            excluded = [s for s in selected_spaces if s not in healthy_set]
+            log(f"🛡️ Health Check Filter: Retained {len(healthy_selected)} verified responsive backend(s) in active rotation.")
+            if excluded:
+                log(f"💤 Automatically filtered out {len(excluded)} non-responsive/sleeping spaces: {', '.join(excluded)}")
+        else:
+            # Fallback if health checks are still running or none confirmed yet
+            log("ℹ️ Health checks in progress. Using all selected spaces with dynamic per-chunk failover.")
+            active_selected_spaces = selected_spaces
+
+    for space_id in active_selected_spaces:
+        if space_id in VERIFIED_SPACES:
+            meta = dict(VERIFIED_SPACES[space_id])
+            meta["target"] = space_id
+            active_backends.append(meta)
+
+    # Add custom manual endpoints (always included if provided)
     for idx, c_url in enumerate([custom_url_1, custom_url_2, custom_url_3], start=1):
         if c_url and c_url.strip():
             clean_url = c_url.strip().rstrip("/")
@@ -462,11 +550,11 @@ def run_distributed_dubbing(
             })
 
     if not active_backends:
-        err_msg = "No backend selected! Please select at least one Space from the API Pool or enter a custom API URL."
+        err_msg = "No responsive backend available! Please check your space selections or add a custom API URL."
         log(f"❌ {err_msg}")
         raise gr.Error(err_msg)
 
-    log(f"🌐 Active Multi-Backend Pool ({len(active_backends)} backends connected):")
+    log(f"🌐 Active Rotation Pool ({len(active_backends)} backends connected):")
     for idx, b in enumerate(active_backends, start=1):
         log(f"   • Backend #{idx}: {b['name']}")
 
@@ -514,8 +602,8 @@ def run_distributed_dubbing(
     backend_rot_idx = 0
 
     log(f"🎬 Dubbing dialogue into target language: **{target_lang_code.upper()}**")
-    log("🔄 Mode: **Strict Sequential Queue** (1-by-1 wait-for-response, zero concurrent collisions)")
-    log(f"⚡ Queueing {num_chunks} chunks across {num_backends} active backend(s)...")
+    log("🔄 Mode: **Strict Sequential Queue** (1-by-1 wait-for-response, zero simultaneous collisions)")
+    log(f"⚡ Processing {num_chunks} chunks sequentially across active backend rotation pool...")
 
     chunk_results: List[Tuple[int, int, str]] = []
     successful_chunks = 0
@@ -528,7 +616,7 @@ def run_distributed_dubbing(
         chunk_success = False
         last_error = None
 
-        # Sequential retry loop across available backends for this chunk
+        # Sequential retry loop across available healthy backends for this chunk
         for attempt in range(num_backends):
             curr_backend_idx = (start_rot + attempt) % num_backends
             b_info = active_backends[curr_backend_idx]
@@ -542,7 +630,7 @@ def run_distributed_dubbing(
                     chunk_text,
                     REFERENCE_VOICE_PATH,
                     target_lang_code,
-                    timeout_seconds=90,
+                    timeout_seconds=75,
                 )
                 call_dur = time.time() - call_start
                 if audio_path and os.path.exists(audio_path):
@@ -550,7 +638,7 @@ def run_distributed_dubbing(
                     chunk_results.append((chunk_idx, start_time_ms, audio_path))
                     chunk_success = True
                     successful_chunks += 1
-                    # Advance rotation pointer so the next chunk goes to the next backend
+                    # Advance rotation pointer so the NEXT chunk goes to the next backend
                     backend_rot_idx = (curr_backend_idx + 1) % num_backends
                     break
                 else:
@@ -559,11 +647,18 @@ def run_distributed_dubbing(
                 call_dur = time.time() - call_start
                 last_error = str(e).replace("\n", " ")
                 log(f"⚠️ [Chunk #{chunk_idx}/{num_chunks}] '{target_name}' error ({call_dur:.2f}s): {last_error}. Retrying next backend...")
+
+                # If backend encountered quota or rate-limiting error, discard from healthy set
+                if any(err_term in last_error.lower() for err_term in ["quota", "rate limit", "429", "timeout", "504"]):
+                    with HEALTHY_BACKENDS_LOCK:
+                        HEALTHY_BACKENDS.discard(b_info.get("target"))
+                    log(f"⛔ Automatically removed '{target_name}' from healthy pool due to quota/timeout.")
+
                 time.sleep(0.5)
 
         if not chunk_success:
             log(f"❌ [Chunk #{chunk_idx}/{num_chunks}] Failed across all {num_backends} backends: {last_error}")
-            # Advance rotation pointer anyway so we don't start on a failing backend for the next chunk
+            # Advance rotation pointer so subsequent chunk starts fresh
             backend_rot_idx = (start_rot + 1) % num_backends
 
         progress(idx / num_chunks, desc=f"Sequential Queue: Chunk [{idx}/{num_chunks}] complete")
@@ -608,7 +703,7 @@ def run_distributed_dubbing(
 # ── Gradio Blocks User Interface ──────────────────────────────────────────────
 
 def build_app() -> gr.Blocks:
-    """Builds the polished Gradio Blocks User Interface with Sequential Queue & Warm-Up Manager."""
+    """Builds the polished Gradio Blocks User Interface with Sequential Queue & Health Check Monitor."""
     theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")
 
     with gr.Blocks(theme=theme, title="🎬 Distributed XTTS-v2 Auto-Dubbing Studio") as demo:
@@ -616,30 +711,30 @@ def build_app() -> gr.Blocks:
         gr.Markdown(
             """
             # 🎬 Distributed XTTS-v2 Auto-Dubbing Studio
-            ### 🌐 Multi-Backend Sequential Queue & Startup Warm-Up Orchestrator
-            Coordinate deep voice cloning across verified Hugging Face Space backends with zero local GPU load.
+            ### 🌐 Multi-Backend Sequential Queue & Active Health Check Orchestrator
+            Coordinate deep voice cloning across 11 verified Hugging Face Space backends with automatic health filtering and zero local GPU overhead.
             """
         )
 
         # 1. API Pool Management Group
         with gr.Group():
-            gr.Markdown("### 🌐 1. Distributed XTTS-v2 API Pool")
+            gr.Markdown("### 🌐 1. Distributed XTTS-v2 API Pool (11 Verified Spaces)")
             gr.Markdown(
-                "All external spaces are automatically pinged on startup to wake their models from sleep. "
-                "Subtitle chunks are processed in a **strict sequential queue** (1-by-1 wait-for-response) "
-                "with automated failover and round-robin load distribution."
+                "All external spaces are tested on startup to detect sleeping or quota-exceeded instances. "
+                "Only responsive backends are retained in active rotation. Subtitle chunks run in a "
+                "**strict sequential queue** (1-by-1 wait-for-response) with automated failover."
             )
 
-            with gr.Accordion("⚡ Backend Startup Warm-Up Status & Health", open=True):
+            with gr.Accordion("⚡ Backend Startup Health Check & Warm-Up Status", open=True):
                 warmup_status_md = gr.Markdown(value=get_warmup_status_markdown())
-                refresh_warmup_btn = gr.Button("🔄 Re-Ping & Refresh Warm-Up Status", size="sm")
+                refresh_warmup_btn = gr.Button("🔄 Re-Ping & Refresh Backend Health", size="sm")
 
             space_choices = list(VERIFIED_SPACES.keys())
             selected_spaces = gr.CheckboxGroup(
-                label="Verified Hardcoded XTTS-v2 Spaces Pool",
+                label="Verified Hardcoded XTTS-v2 Spaces Pool (11 Backends)",
                 choices=space_choices,
                 value=space_choices,
-                info="All verified backends are active by default for rotation and failover.",
+                info="All verified backends are selected by default. Dead or sleeping spaces are automatically filtered out at runtime.",
             )
 
             with gr.Accordion("➕ Add Custom Space / Server APIs (Optional)", open=False):
@@ -678,6 +773,10 @@ def build_app() -> gr.Blocks:
                         ("French (fr)", "fr"),
                         ("Spanish (es)", "es"),
                         ("Portuguese (pt)", "pt"),
+                        ("Russian (ru)", "ru"),
+                        ("Arabic (ar)", "ar"),
+                        ("German (de)", "de"),
+                        ("Japanese (ja)", "ja"),
                     ],
                     value="hi",
                     info="Select target speech translation language.",
@@ -740,7 +839,7 @@ def build_app() -> gr.Blocks:
     return demo
 
 
-# Automatically initiate lightweight background wake-up pings to all hardcoded spaces on startup
+# Automatically initiate background health check & wake-up pings to all 11 spaces on startup
 threading.Thread(target=run_startup_warmup_all, daemon=True).start()
 
 app = build_app()
