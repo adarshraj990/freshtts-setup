@@ -81,26 +81,30 @@ def synthesize_speech(
     api_url: str,
     text: str,
     language: str,
+    use_default_voice: bool,
     audio_path: Optional[str],
 ) -> Tuple[Optional[str], str]:
     """
     Connects to the external Kaggle FastAPI backend running Coqui XTTS-v2.
     Formats the endpoint, applies Localtunnel headers, and handles errors.
     """
-    # 1. Validation & Reference Audio Fallback
+    # 1. Validation & Reference Audio Resolution
     if not api_url or not api_url.strip():
         return None, "❌ Error: Please enter your active Kaggle API URL."
 
     if not text or not text.strip():
         return None, "❌ Error: Please enter the text you want to synthesize."
 
-    # Use uploaded audio if provided, otherwise fallback to default reference_voice.wav
-    resolved_audio_path = audio_path
-    if not resolved_audio_path or not os.path.isfile(resolved_audio_path):
+    # When checkbox is ticked, use reference_voice.wav; otherwise use uploaded/recorded audio
+    if use_default_voice:
         if os.path.isfile(DEFAULT_REFERENCE_VOICE):
             resolved_audio_path = DEFAULT_REFERENCE_VOICE
         else:
-            return None, "❌ Error: Please upload or record a reference voice audio sample."
+            return None, "❌ Error: Built-in 'reference_voice.wav' not found on the server."
+    else:
+        if not audio_path or not os.path.isfile(audio_path):
+            return None, "❌ Error: Please upload/record an audio sample, OR tick 'Use Default Voice (reference_voice.wav)'."
+        resolved_audio_path = audio_path
 
     # 2. Endpoint Formatting (Sanitize trailing slashes and ensure route)
     clean_url = api_url.strip().rstrip("/")
@@ -234,11 +238,29 @@ def build_app() -> gr.Blocks:
                     info="Select target speech language.",
                 )
 
-                default_voice = DEFAULT_REFERENCE_VOICE if os.path.isfile(DEFAULT_REFERENCE_VOICE) else None
+                use_default_voice_cb = gr.Checkbox(
+                    label="🎯 Use Default Voice (reference_voice.wav)",
+                    value=False,
+                    info="Tick this box to use the built-in reference_voice.wav. Untick to upload your own audio.",
+                )
+
                 ref_audio_input = gr.Audio(
-                    label="Reference Voice Sample (Default: reference_voice.wav)",
+                    label="Reference Voice Audio (Upload or Record)",
                     type="filepath",
-                    value=default_voice,
+                    value=None,
+                )
+
+                def on_toggle_default_voice(is_checked: bool):
+                    if is_checked:
+                        val = DEFAULT_REFERENCE_VOICE if os.path.isfile(DEFAULT_REFERENCE_VOICE) else None
+                        return gr.update(value=val, interactive=False)
+                    else:
+                        return gr.update(value=None, interactive=True)
+
+                use_default_voice_cb.change(
+                    fn=on_toggle_default_voice,
+                    inputs=[use_default_voice_cb],
+                    outputs=[ref_audio_input],
                 )
 
                 submit_btn = gr.Button("🚀 Generate Speech", variant="primary", size="lg")
@@ -263,6 +285,7 @@ def build_app() -> gr.Blocks:
                 api_url_input,
                 text_input,
                 language_dropdown,
+                use_default_voice_cb,
                 ref_audio_input,
             ],
             outputs=[
