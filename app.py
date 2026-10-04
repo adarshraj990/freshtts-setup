@@ -30,6 +30,48 @@ try:
 except Exception:
     pass
 
+# ── Monkey-patch gradio_client schema parsing bug (bool is not iterable) ──────
+try:
+    import gradio_client.utils
+    if hasattr(gradio_client.utils, "get_type"):
+        _orig_get_type = gradio_client.utils.get_type
+        def _safe_get_type(schema):
+            if isinstance(schema, bool):
+                return "boolean"
+            if not isinstance(schema, dict):
+                return "any"
+            return _orig_get_type(schema)
+        gradio_client.utils.get_type = _safe_get_type
+
+    if hasattr(gradio_client.utils, "_json_schema_to_python_type"):
+        _orig_schema_to_type = gradio_client.utils._json_schema_to_python_type
+        def _safe_schema_to_type(schema, defs=None):
+            if isinstance(schema, bool):
+                return "bool"
+            if not isinstance(schema, dict):
+                return "Any"
+            try:
+                return _orig_schema_to_type(schema, defs)
+            except Exception:
+                return "Any"
+        gradio_client.utils._json_schema_to_python_type = _safe_schema_to_type
+except Exception:
+    pass
+
+# ── Monkey-patch gradio get_api_info for robust ASGI route initialization ─────
+try:
+    import gradio.blocks
+    if hasattr(gradio.blocks.Block, "get_api_info"):
+        _orig_get_api_info = gradio.blocks.Block.get_api_info
+        def _safe_get_api_info(self):
+            try:
+                return _orig_get_api_info(self)
+            except Exception:
+                return {}
+        gradio.blocks.Block.get_api_info = _safe_get_api_info
+except Exception:
+    pass
+
 
 def synthesize_speech(
     api_url: str,
@@ -225,6 +267,6 @@ app = build_app()
 
 if __name__ == "__main__":
     try:
-        app.launch(server_name="0.0.0.0", server_port=7860)
+        app.launch(server_name="0.0.0.0", server_port=7860, show_api=False)
     except ValueError:
-        app.launch()
+        app.launch(show_api=False)
