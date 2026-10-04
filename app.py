@@ -73,6 +73,10 @@ except Exception:
     pass
 
 
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_REFERENCE_VOICE = str(BASE_DIR / "reference_voice.wav")
+
+
 def synthesize_speech(
     api_url: str,
     text: str,
@@ -83,15 +87,20 @@ def synthesize_speech(
     Connects to the external Kaggle FastAPI backend running Coqui XTTS-v2.
     Formats the endpoint, applies Localtunnel headers, and handles errors.
     """
-    # 1. Validation
+    # 1. Validation & Reference Audio Fallback
     if not api_url or not api_url.strip():
         return None, "❌ Error: Please enter your active Kaggle API URL."
 
     if not text or not text.strip():
         return None, "❌ Error: Please enter the text you want to synthesize."
 
-    if not audio_path or not os.path.isfile(audio_path):
-        return None, "❌ Error: Please upload or record a reference voice audio sample."
+    # Use uploaded audio if provided, otherwise fallback to default reference_voice.wav
+    resolved_audio_path = audio_path
+    if not resolved_audio_path or not os.path.isfile(resolved_audio_path):
+        if os.path.isfile(DEFAULT_REFERENCE_VOICE):
+            resolved_audio_path = DEFAULT_REFERENCE_VOICE
+        else:
+            return None, "❌ Error: Please upload or record a reference voice audio sample."
 
     # 2. Endpoint Formatting (Sanitize trailing slashes and ensure route)
     clean_url = api_url.strip().rstrip("/")
@@ -116,14 +125,14 @@ def synthesize_speech(
         "target_lang": language.strip().lower(),
     }
 
-    filename = Path(audio_path).name
+    filename = Path(resolved_audio_path).name
     mime_type = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
 
     start_time = time.time()
 
     # 5. Remote API Call with Robust Error Handling
     try:
-        with open(audio_path, "rb") as f1, open(audio_path, "rb") as f2:
+        with open(resolved_audio_path, "rb") as f1, open(resolved_audio_path, "rb") as f2:
             files = [
                 ("speaker_wav", (filename, f1, mime_type)),
                 ("reference_voice", (filename, f2, mime_type)),
@@ -225,9 +234,11 @@ def build_app() -> gr.Blocks:
                     info="Select target speech language.",
                 )
 
+                default_voice = DEFAULT_REFERENCE_VOICE if os.path.isfile(DEFAULT_REFERENCE_VOICE) else None
                 ref_audio_input = gr.Audio(
-                    label="Reference Voice Sample",
+                    label="Reference Voice Sample (Default: reference_voice.wav)",
                     type="filepath",
+                    value=default_voice,
                 )
 
                 submit_btn = gr.Button("🚀 Generate Speech", variant="primary", size="lg")
