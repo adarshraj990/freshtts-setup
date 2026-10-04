@@ -220,11 +220,16 @@ def synthesize_chunk_with_retry(
                 # Direct binary audio stream
                 return resp.content, None
 
-            elif attempt < max_retries and resp.status_code in [502, 503, 504]:
+            elif attempt < max_retries and resp.status_code in [500, 502, 503, 504]:
                 time.sleep(1.0)
                 continue
             else:
-                return None, f"HTTP {resp.status_code}: {resp.text[:120]}"
+                try:
+                    err_json = resp.json()
+                    detail = err_json.get("detail", resp.text[:140])
+                    return None, f"HTTP {resp.status_code}: {detail}"
+                except Exception:
+                    return None, f"HTTP {resp.status_code}: {resp.text[:140]}"
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
             if attempt < max_retries:

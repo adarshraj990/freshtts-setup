@@ -1,95 +1,42 @@
-# 🚀 Kaggle / Google Colab Dual-GPU XTTS-v2 FastAPI Backend Setup & Execution Script
-## Thread-Safe Dual-GPU Architecture for High-Throughput Subtitle Voice Cloning
+"""
+🚀 High-Performance Dual-GPU XTTS-v2 FastAPI Backend Server
+Designed for Kaggle (2x T4 GPUs), Google Colab, and Multi-GPU Environments.
 
-This guide provides the complete, copy-pasteable script to run on **Kaggle Notebooks (Dual T4 GPUs)** or **Google Colab (T4 GPU)**.
-
-It eliminates the **HTTP 500 Internal Server Error** caused by concurrent requests colliding on the same CUDA device.
-
----
-
-### 🛡️ Core Concurrency & Reliability Fixes
-
-1. **Thread-Safe Model Binding (`cuda:0` and `cuda:1`)**:
-   - Each GPU initializes its own independent `XTTS-v2` model instance.
-   - Each model is protected by its own `threading.Lock()` and `asyncio.Lock()`.
-2. **Dedicated Worker Queue (`asyncio.Queue`)**:
-   - Incoming requests from the frontend ThreadPoolExecutor enter a round-robin worker queue.
-   - Each GPU executes **strictly 1 synthesis request at a time**, eliminating race conditions and illegal memory accesses.
-   - Synchronous CUDA synthesis is dispatched via `asyncio.to_thread` so that both GPUs synthesize in parallel without blocking the FastAPI event loop.
-3. **Early Input Validation (HTTP 400)**:
-   - Immediately checks for empty or whitespace-only text before touching the model or GPU.
-   - Returns a structured HTTP 400 Bad Request instead of causing the model tokenizer to crash.
-4. **CUDA Memory & Exception Recovery**:
-   - Wraps `model.tts_to_file` in a `try...except` block catching `torch.cuda.OutOfMemoryError`, `torch.cuda.CudaError`, and `RuntimeError`.
-   - Automatically executes `torch.cuda.empty_cache()` and `gc.collect()` upon error.
-   - Returns clean, meaningful JSON error responses rather than unhandled 500 server crashes.
-5. **Health Check & Latency Endpoint**:
-   - Built-in `GET /` and `GET /health` returning worker states, queue capacity, and memory metrics.
-   - Pre-configured for Localtunnel (`npx localtunnel --port 8000`) and Ngrok.
-
----
-
-### 📋 Setup Instructions for Kaggle (2x T4 GPUs)
-
-1. Open a new or existing **Kaggle Notebook**.
-2. Under **Notebook settings** (right sidebar):
-   - **Accelerator**: Select **GPU T4 x 2**
-   - **Internet**: Ensure **Internet on** is enabled.
-3. Paste the complete code cell below into your Kaggle notebook and click **Run**.
-4. The script will install dependencies, load models on both `cuda:0` and `cuda:1`, start the FastAPI server on port 8000, and launch Localtunnel.
-5. Copy the generated public tunnel URL (e.g., `https://xxxx.loca.lt`) and paste it into the **Kaggle API URL** textbox in your Hugging Face Space frontend.
-6. Click **🔍 Check Connection** to verify green latency status!
-
----
-
-### 💻 All-In-One Kaggle / Colab Notebook Script
-
-```python
-# ==============================================================================
-# 🚀 High-Performance Dual-GPU XTTS-v2 FastAPI Backend Server
-# Thread-Safe Concurrency & Worker Queue for Kaggle (2x T4 GPUs) & Google Colab
-# ==============================================================================
-
-import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["COQUI_TOS_AGREED"] = "1"
-
-print("=" * 70)
-print("📦 STEP 1: Installing System Dependencies (ffmpeg, espeak-ng, nodejs)...")
-print("=" * 70)
-!apt-get update -qq && apt-get install -y -qq ffmpeg libsndfile1 espeak-ng nodejs npm
-
-print("\n" + "=" * 70)
-print("⚡ STEP 2: Installing Python Packages (fastapi, uvicorn, TTS, pyngrok)...")
-print("=" * 70)
-!pip install -q --upgrade pip
-!pip install -q "numpy>=1.24.0,<2.0.0" "transformers>=4.39.0,<4.45.0"
-!pip install -q --no-build-isolation git+https://github.com/idiap/coqui-ai-TTS
-!pip install -q fastapi uvicorn python-multipart soundfile pydub pyngrok
-
-print("\n" + "=" * 70)
-print("🔧 STEP 3: Initializing Thread-Safe Dual-GPU FastAPI Server...")
-print("=" * 70)
+Concurrency & Stability Architecture:
+1. Dedicated GPU Worker Instances:
+   - Separate XTTS-v2 instance loaded on 'cuda:0' and 'cuda:1' (or CPU fallback).
+   - Dedicated threading.Lock() and asyncio.Lock() per GPU instance.
+   - An asyncio.Queue worker pool distributes requests across available GPUs.
+   - Guarantees each GPU processes strictly ONE synthesis task at a time (zero thread collision).
+2. Non-Blocking Async Execution:
+   - Dispatches synchronous PyTorch synthesis via asyncio.to_thread to run both GPUs in parallel.
+3. Input Validation:
+   - Validates text and reference audio; returns HTTP 400 for empty or whitespace-only text.
+4. Error & CUDA Memory Management:
+   - Catches CUDA OOM and runtime errors, invokes torch.cuda.empty_cache() and gc.collect().
+   - Returns structured JSON error messages instead of raw 500 crashes.
+5. Health Checks & Tunnel Support:
+   - GET / and GET /health endpoints for instant latency & status monitoring.
+   - Compatible with Localtunnel, Ngrok, and Cloudflare tunnels.
+"""
 
 import asyncio
 from contextlib import asynccontextmanager
 import gc
 import logging
+import os
 from pathlib import Path
 import shutil
-import subprocess
-import sys
 import tempfile
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 import uuid
-import urllib.request
 
-import torch
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from fastapi.responses import JSONResponse
+import torch
 
 # Configure Logging
 logging.basicConfig(
@@ -98,36 +45,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xtts_dual_gpu")
 
-# ── Monkey Patch for librosa / TTS pkg_resources compatibility ───────────────
-import types
-if "pkg_resources" not in sys.modules:
-    try:
-        import pkg_resources
-    except ModuleNotFoundError:
-        import importlib.resources
-        pr = types.ModuleType("pkg_resources")
-        def resource_filename(package_or_requirement, resource_name):
-            try:
-                return str(importlib.resources.files(package_or_requirement) / resource_name)
-            except Exception:
-                return resource_name
-        pr.resource_filename = resource_filename
-        sys.modules["pkg_resources"] = pr
-
-# ── PyTorch 2.6+ weights_only safe loader patch ──────────────────────────────
-_orig_torch_load = torch.load
-def _safe_torch_load(*args, **kwargs):
-    if "weights_only" not in kwargs:
-        kwargs["weights_only"] = False
-    return _orig_torch_load(*args, **kwargs)
-torch.load = _safe_torch_load
-
 
 # ── GPU Worker Abstraction ───────────────────────────────────────────────────
 
 class GPUWorker:
     """
-    Encapsulates an XTTS-v2 model bound to a dedicated CUDA device.
+    Encapsulates a single XTTS-v2 model bound to a dedicated CUDA device.
     Strictly synchronizes inference using both threading.Lock and asyncio.Lock.
     """
 
@@ -142,7 +65,7 @@ class GPUWorker:
     def synthesize(self, text: str, ref_audio_path: str, language: str, output_path: str) -> None:
         """
         Synchronous synthesis worker executed inside a dedicated worker thread.
-        Strictly serialized per GPU device using self.thread_lock.
+        Strictly serialized per GPU using self.thread_lock.
         """
         with self.thread_lock:
             self.is_busy = True
@@ -164,6 +87,7 @@ class GPUWorker:
                         file_path=str(output_path),
                     )
                 elif hasattr(self.model, "inference"):
+                    # Fallback for direct Xtts model instances
                     import soundfile as sf
                     import numpy as np
 
@@ -187,7 +111,7 @@ class GPUWorker:
 
                 elapsed = time.time() - t_start
                 self.total_synthesized += 1
-                logger.info(f"[{self.device}] Completed in {elapsed:.2f}s (Total: {self.total_synthesized})")
+                logger.info(f"[{self.device}] Synthesis finished in {elapsed:.2f}s (Total on GPU: {self.total_synthesized})")
 
             except torch.cuda.OutOfMemoryError as oom_err:
                 logger.error(f"[{self.device}] CUDA OutOfMemoryError: {oom_err}")
@@ -197,7 +121,7 @@ class GPUWorker:
                     except Exception:
                         pass
                 gc.collect()
-                raise RuntimeError(f"CUDA Out of Memory on {self.device}. Cache cleared.") from oom_err
+                raise RuntimeError(f"CUDA Out of Memory on {self.device}. Cache cleared. Try shortening text chunk.") from oom_err
 
             except torch.cuda.CudaError as cuda_err:
                 logger.error(f"[{self.device}] CUDA Error: {cuda_err}")
@@ -207,10 +131,10 @@ class GPUWorker:
                     except Exception:
                         pass
                 gc.collect()
-                raise RuntimeError(f"CUDA Hardware Error on {self.device}: {cuda_err}") from cuda_err
+                raise RuntimeError(f"CUDA Hardware/Driver Error on {self.device}: {cuda_err}") from cuda_err
 
             except Exception as e:
-                logger.error(f"[{self.device}] Synthesis error: {e}", exc_info=True)
+                logger.error(f"[{self.device}] Synthesis failed: {e}", exc_info=True)
                 if self.device.startswith("cuda"):
                     try:
                         torch.cuda.empty_cache()
@@ -230,10 +154,39 @@ gpu_queue: asyncio.Queue = asyncio.Queue()
 
 
 def initialize_xtts_models() -> List[GPUWorker]:
-    """Loads independent XTTS-v2 models on all detected CUDA GPUs (Dual-GPU support)."""
+    """
+    Initializes independent XTTS-v2 model instances on all detected CUDA GPUs.
+    Supports Dual-GPU (cuda:0 and cuda:1 on Kaggle), single GPU, or CPU fallback.
+    """
     initialized_workers: List[GPUWorker] = []
+
+    # Monkey patch pkg_resources for librosa/TTS compatibility
+    import sys
+    import types
+    if "pkg_resources" not in sys.modules:
+        try:
+            import pkg_resources
+        except ModuleNotFoundError:
+            import importlib.resources
+            pr = types.ModuleType("pkg_resources")
+            def resource_filename(package_or_requirement, resource_name):
+                try:
+                    return str(importlib.resources.files(package_or_requirement) / resource_name)
+                except Exception:
+                    return resource_name
+            pr.resource_filename = resource_filename
+            sys.modules["pkg_resources"] = pr
+
+    # Safe PyTorch 2.6+ weights_only loader patch
+    _orig_torch_load = torch.load
+    def _safe_torch_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _orig_torch_load(*args, **kwargs)
+    torch.load = _safe_torch_load
+
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(f"Hardware Detection: Found {num_gpus} CUDA device(s).")
+    logger.info(f"Hardware Detection: Found {num_gpus} CUDA device(s).")
 
     if num_gpus >= 2:
         devices = ["cuda:0", "cuda:1"]
@@ -245,7 +198,7 @@ def initialize_xtts_models() -> List[GPUWorker]:
     from TTS.api import TTS
 
     for dev in devices:
-        print(f"⏳ Loading XTTS-v2 on device '{dev}'...")
+        logger.info(f"⏳ Initializing XTTS-v2 on device '{dev}'...")
         t0 = time.time()
         try:
             if dev.startswith("cuda"):
@@ -258,25 +211,27 @@ def initialize_xtts_models() -> List[GPUWorker]:
 
             worker = GPUWorker(device=dev, model=model)
             initialized_workers.append(worker)
-            print(f"✅ Loaded XTTS-v2 on '{dev}' in {time.time() - t0:.2f}s")
-        except Exception as e:
-            print(f"❌ Failed to load on {dev}: {e}")
+            logger.info(f"✅ Successfully loaded XTTS-v2 on '{dev}' in {time.time() - t0:.2f}s")
+        except Exception as init_err:
+            logger.error(f"❌ Failed to load model on {dev}: {init_err}", exc_info=True)
             if not initialized_workers and dev == devices[-1]:
-                raise e
+                raise init_err
 
     return initialized_workers
 
 
-# ── FastAPI Lifespan & Application ───────────────────────────────────────────
+# ── FastAPI Application Lifespan ─────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global workers
+    logger.info("🚀 Starting Dual-GPU XTTS-v2 FastAPI Backend Service...")
     workers = initialize_xtts_models()
     for worker in workers:
         await gpu_queue.put(worker)
-    print(f"🎉 Server ready! {len(workers)} GPU worker(s) in active queue.")
+    logger.info(f"🎉 Engine ready! {len(workers)} worker(s) active in saturated queue.")
     yield
+    logger.info("🛑 Shutting down Dual-GPU XTTS-v2 Backend...")
     for w in workers:
         if w.device.startswith("cuda"):
             try:
@@ -286,11 +241,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="XTTS-v2 Dual-GPU FastAPI Backend",
+    title="XTTS-v2 Dual-GPU Distributed API Backend",
+    description="High-throughput thread-safe FastAPI backend for subtitle dubbing and voice cloning.",
     version="2.0.0",
     lifespan=lifespan,
 )
 
+# Enable CORS for cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -300,10 +257,15 @@ app.add_middleware(
 )
 
 
+# ── Health Check Endpoints ───────────────────────────────────────────────────
+
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    """Health check endpoint verified by the Frontend Connection Check."""
+    """
+    Lightweight health check endpoint returning GPU status, worker availability,
+    and memory statistics for the frontend connection health check.
+    """
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     worker_status = []
     for w in workers:
@@ -312,6 +274,7 @@ async def health_check():
             "busy": w.is_busy,
             "total_synthesized": w.total_synthesized,
         })
+
     return {
         "status": "healthy",
         "service": "XTTS-v2 Dual-GPU Backend",
@@ -322,6 +285,8 @@ async def health_check():
     }
 
 
+# ── Voice Clone Synthesis Endpoint ───────────────────────────────────────────
+
 @app.post("/voice_clone_synthesis")
 async def voice_clone_synthesis(
     text: Optional[str] = Form(None),
@@ -331,16 +296,21 @@ async def voice_clone_synthesis(
     speaker_wav: Optional[UploadFile] = File(None),
     reference_voice: Optional[UploadFile] = File(None),
 ):
+    """
+    Dispatches synthesis to the next available GPU worker in the pool.
+    Guarantees strict single-thread execution per GPU device.
+    """
     # 1. Input Validation: Check text
     raw_text = text if (text is not None and text.strip()) else text_chunk
     if not raw_text or not raw_text.strip():
+        logger.warning("Rejected synthesis request: empty or whitespace-only text.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Validation Error: 'text' or 'text_chunk' cannot be empty or whitespace-only.",
         )
     clean_text = raw_text.strip()
 
-    # Resolve target language
+    # Resolve target language code
     raw_lang = language if language else target_lang
     clean_lang = (raw_lang or "hi").strip().lower()
 
@@ -349,7 +319,7 @@ async def voice_clone_synthesis(
     if ref_file is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Validation Error: Speaker audio file ('speaker_wav' or 'reference_voice') is required.",
+            detail="Validation Error: Speaker reference audio file ('speaker_wav' or 'reference_voice') is required.",
         )
 
     # 2. Stage temporary files
@@ -368,10 +338,10 @@ async def voice_clone_synthesis(
         with open(ref_audio_path, "wb") as f:
             f.write(content)
 
-        # 3. Acquire available GPU worker from queue (asynchronously waits if all are busy)
+        # 3. Acquire available GPU worker from queue (blocks asynchronously until a GPU is free)
         worker: GPUWorker = await gpu_queue.get()
         try:
-            # Dispatch to worker thread while holding worker's async lock
+            # Concurrently synthesize using asyncio.to_thread while holding the worker's async lock
             async with worker.async_lock:
                 await asyncio.to_thread(
                     worker.synthesize,
@@ -386,7 +356,7 @@ async def voice_clone_synthesis(
                 detail=f"Inference Failure on {worker.device}: {str(synth_err)}",
             )
         finally:
-            # Release worker back to pool for next waiting task
+            # Always return worker to pool for next waiting task
             await gpu_queue.put(worker)
             gpu_queue.task_done()
 
@@ -415,30 +385,53 @@ async def voice_clone_synthesis(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ==============================================================================
-# 🌐 STEP 4: Start Localtunnel & Launch Server
-# ==============================================================================
+# ── Tunnel & Server Execution Helpers ────────────────────────────────────────
 
-def launch_server(port: int = 8000):
+def launch_server(port: int = 8000, use_localtunnel: bool = True, ngrok_token: Optional[str] = None):
+    """
+    Launches uvicorn server along with Localtunnel or Ngrok for instant public access.
+    """
+    import subprocess
+    import threading
+
     def run_tunnel():
         time.sleep(2)
-        try:
-            print("=" * 70)
-            print("🌐 Starting Localtunnel on port 8000...")
+        if ngrok_token:
             try:
-                with urllib.request.urlopen("https://loca.lt/mytunnelpassword", timeout=5) as resp:
-                    pwd = resp.read().decode("utf-8").strip()
-                    print(f"🔑 Localtunnel IP Password (if prompted in browser): {pwd}")
-            except Exception:
-                pass
-            print("=" * 70)
-            cmd = f"npx -y localtunnel --port {port}"
-            subprocess.Popen(cmd, shell=True)
-        except Exception as e:
-            print(f"Tunnel launch error: {e}")
+                from pyngrok import ngrok
+                ngrok.set_auth_token(ngrok_token)
+                public_url = ngrok.connect(port).public_url
+                print("=" * 70)
+                print(f"🌐 NGROK PUBLIC API URL: {public_url}")
+                print(f"👉 Target Endpoint: {public_url}/voice_clone_synthesis")
+                print("=" * 70)
+                return
+            except Exception as e:
+                print(f"Ngrok launch failed: {e}. Falling back to Localtunnel.")
+
+        if use_localtunnel:
+            try:
+                print("=" * 70)
+                print("🌐 Launching Localtunnel (port 8000)...")
+                # Retrieve Localtunnel password
+                import urllib.request
+                try:
+                    with urllib.request.urlopen("https://loca.lt/mytunnelpassword", timeout=5) as resp:
+                        pwd = resp.read().decode("utf-8").strip()
+                        print(f"🔑 Localtunnel IP Password (if prompted in browser): {pwd}")
+                except Exception:
+                    pass
+                print("=" * 70)
+                cmd = f"npx -y localtunnel --port {port}"
+                subprocess.Popen(cmd, shell=True)
+            except Exception as e:
+                print(f"Localtunnel failed: {e}")
 
     threading.Thread(target=run_tunnel, daemon=True).start()
+
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
-launch_server(port=8000)
-```
+
+if __name__ == "__main__":
+    launch_server(port=8000, use_localtunnel=True)
