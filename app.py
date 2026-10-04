@@ -237,6 +237,63 @@ def synthesize_chunk_with_retry(
     return None, "Failed after retry"
 
 
+# ── Interactive Backend Connection Health Check ──────────────────────────────
+
+def check_connection_health(api_url: str):
+    """
+    Lightweight, non-blocking health check ping to the remote Kaggle API endpoint.
+    Verifies tunnel availability (Localtunnel / Ngrok), validates bypass headers,
+    and calculates network roundtrip latency in milliseconds.
+    """
+    raw_url = (api_url or "").strip()
+    if not raw_url:
+        yield "⚪ **Not Connected** *(Please enter your Kaggle API URL first)*"
+        return
+
+    # Automatically prefix protocol if omitted
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = f"https://{raw_url}"
+
+    clean_url = raw_url.rstrip("/")
+
+    # Derive root URL if user supplied the synthesis endpoint
+    if clean_url.endswith("/voice_clone_synthesis"):
+        root_url = clean_url[:-len("/voice_clone_synthesis")].rstrip("/")
+    else:
+        root_url = clean_url
+
+    yield "⏳ **Checking...**"
+
+    t0 = time.time()
+    try:
+        # Ping the root URL with short 7-second timeout and tunnel bypass headers
+        resp = requests.get(
+            f"{root_url}/",
+            headers=TUNNEL_HEADERS,
+            timeout=7,
+            allow_redirects=True,
+        )
+        latency_ms = max(1, int((time.time() - t0) * 1000))
+
+        # Status code evaluation:
+        # 200, 204: Active and healthy
+        # 301, 302, 307, 308: Active redirection
+        # 404, 405: Remote server is alive and responding (FastAPI / Flask root)
+        if resp.status_code in [200, 204, 301, 302, 307, 308, 404, 405]:
+            yield f"✅ **Connected (Latency: {latency_ms}ms)**"
+        elif resp.status_code in [502, 503, 504]:
+            yield f"❌ **Connection Failed / Timeout** (HTTP {resp.status_code} Bad Gateway — Kaggle GPU worker or tunnel is offline)"
+        else:
+            yield f"⚠️ **Connected with warning** (Latency: {latency_ms}ms | HTTP {resp.status_code})"
+
+    except requests.exceptions.Timeout:
+        yield "❌ **Connection Failed / Timeout** (Server did not respond within 7s — verify Kaggle notebook is active)"
+    except requests.exceptions.ConnectionError:
+        yield "❌ **Connection Failed / Timeout** (Host unreachable or tunnel domain expired/offline)"
+    except Exception as e:
+        yield f"❌ **Connection Failed / Timeout** ({str(e)[:100]})"
+
+
 # ── High-Throughput Saturated SRT Voice Cloning Engine ────────────────────────
 
 def run_high_throughput_srt_pipeline(
@@ -499,13 +556,18 @@ def build_app() -> gr.Blocks:
             with gr.Column(scale=5):
                 gr.Markdown("### 📥 1. Connection & Subtitle Configuration")
 
-                kaggle_url_input = gr.Textbox(
-                    label="Kaggle API URL (Dynamic Localtunnel / Ngrok)",
-                    placeholder="https://famous-sheep-wash.loca.lt or https://xxxx.ngrok-free.app",
-                    value="",
-                    lines=1,
-                    info="Paste your active Kaggle GPU tunnel URL. Automatically routes to /voice_clone_synthesis.",
-                )
+                with gr.Row():
+                    kaggle_url_input = gr.Textbox(
+                        label="Kaggle API URL (Dynamic Localtunnel / Ngrok)",
+                        placeholder="https://famous-sheep-wash.loca.lt or https://xxxx.ngrok-free.app",
+                        value="",
+                        lines=1,
+                        scale=7,
+                        info="Paste your active Kaggle GPU tunnel URL. Automatically routes to /voice_clone_synthesis.",
+                    )
+                    check_conn_btn = gr.Button("🔍 Check Connection", variant="secondary", scale=3)
+
+                conn_status_box = gr.Markdown("⚪ **Not Connected**")
 
                 srt_file_input = gr.File(
                     label="Upload SRT Subtitle File (.srt)",
@@ -583,6 +645,18 @@ def build_app() -> gr.Blocks:
                     autoscroll=True,
                     placeholder="Real-time chunk progress, throughput (chunks/sec), and cache hits will appear here...",
                 )
+
+        check_conn_btn.click(
+            fn=check_connection_health,
+            inputs=[kaggle_url_input],
+            outputs=[conn_status_box],
+        )
+
+        kaggle_url_input.submit(
+            fn=check_connection_health,
+            inputs=[kaggle_url_input],
+            outputs=[conn_status_box],
+        )
 
         submit_btn.click(
             fn=run_high_throughput_srt_pipeline,
