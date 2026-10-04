@@ -1,3 +1,5 @@
 gradio==4.40.0
 requests
+pysrt
+pydub
 huggingface_hub<0.23.0
