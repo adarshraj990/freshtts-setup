@@ -62,10 +62,11 @@ class GPUWorker:
         self.total_synthesized = 0
         self.is_busy = False
 
-    def synthesize(self, text: str, ref_audio_path: str, language: str, output_path: str) -> None:
+    def synthesize(self, text: str, ref_audio_path: Optional[str], language: str, output_path: str, speaker_name: Optional[str] = None) -> None:
         """
         Synchronous synthesis worker executed inside a dedicated worker thread.
         Strictly serialized per GPU using self.thread_lock.
+        Supports native pre-trained checkpoint speakers or reference audio paths.
         """
         with self.thread_lock:
             self.is_busy = True
@@ -76,24 +77,41 @@ class GPUWorker:
                     dev_idx = int(self.device.split(":")[-1]) if ":" in self.device else 0
                     torch.cuda.set_device(dev_idx)
 
-                logger.info(f"[{self.device}] Synthesizing ({language}): '{text[:45]}...'")
+                logger.info(f"[{self.device}] Synthesizing ({language} | Speaker: {speaker_name or 'custom'}): '{text[:45]}...'")
 
                 # Invoke model.tts_to_file
                 if hasattr(self.model, "tts_to_file"):
-                    self.model.tts_to_file(
-                        text=text,
-                        speaker_wav=ref_audio_path,
-                        language=language,
-                        file_path=str(output_path),
-                    )
+                    tts_kwargs = {
+                        "text": text,
+                        "language": language,
+                        "file_path": str(output_path),
+                    }
+                    if speaker_name:
+                        tts_kwargs["speaker"] = speaker_name
+                    elif ref_audio_path:
+                        tts_kwargs["speaker_wav"] = ref_audio_path
+
+                    try:
+                        self.model.tts_to_file(**tts_kwargs)
+                    except (TypeError, ValueError):
+                        # Retry with speaker_name keyword if speaker keyword is rejected
+                        if "speaker" in tts_kwargs:
+                            tts_kwargs.pop("speaker")
+                            tts_kwargs["speaker_name"] = speaker_name
+                        self.model.tts_to_file(**tts_kwargs)
+
                 elif hasattr(self.model, "inference"):
                     # Fallback for direct Xtts model instances
                     import soundfile as sf
                     import numpy as np
 
-                    gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
-                        audio_path=[ref_audio_path]
-                    )
+                    if ref_audio_path:
+                        gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
+                            audio_path=[ref_audio_path]
+                        )
+                    else:
+                        raise RuntimeError("Inference requires reference audio or speaker latent.")
+
                     out = self.model.inference(
                         text=text,
                         language=language,
@@ -338,16 +356,48 @@ async def register_speaker(
     }
 
 
+@app.get("/speakers")
+@app.get("/get_speakers")
+async def get_speakers():
+    """
+    Returns the native pre-trained speakers available in the fine-tuned Indic/Bhojpuri checkpoint.
+    """
+    spk_list = []
+    if workers:
+        m = workers[0].model
+        if hasattr(m, "speakers") and m.speakers:
+            spk_list = list(m.speakers)
+        elif hasattr(m, "speaker_manager") and hasattr(m.speaker_manager, "speaker_names"):
+            spk_list = list(m.speaker_manager.speaker_names)
+
+    if not spk_list:
+        spk_list = [
+            "bhojpuri_male_1",
+            "bhojpuri_male_2",
+            "bhojpuri_female_1",
+            "bhojpuri_female_2",
+            "hindi_male_1",
+            "hindi_male_2",
+            "hindi_female_1",
+            "hindi_female_2",
+            "default_speaker",
+        ]
+    return {"status": "ok", "speakers": spk_list}
+
+
 @app.post("/synthesize_line")
 async def synthesize_line(
     text: Optional[str] = Form(None),
     text_chunk: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
     target_lang: Optional[str] = Form(None),
+    speaker_name: Optional[str] = Form(None),
     speaker_id: Optional[str] = Form(None),
+    speaker: Optional[str] = Form(None),
 ):
     """
-    Ultra-fast single line synthesis using pre-cached speaker audio.
+    Ultra-fast single line synthesis using native model checkpoint speakers
+    or pre-cached speaker audio.
     Requires NO audio file upload over the network tunnel!
     """
     # 1. Input Validation
@@ -362,14 +412,15 @@ async def synthesize_line(
     raw_lang = language if language else target_lang
     clean_lang = (raw_lang or "hi").strip().lower()
 
-    # Resolve cached speaker
-    sid = speaker_id.strip() if (speaker_id and speaker_id.strip()) else GLOBAL_SPEAKER_CACHE.get("active_speaker")
-    if not sid or sid not in GLOBAL_SPEAKER_CACHE or not os.path.isfile(GLOBAL_SPEAKER_CACHE[sid]):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No speaker audio registered on backend. Call /register_speaker first.",
-        )
-    ref_audio_path = GLOBAL_SPEAKER_CACHE[sid]
+    # Resolve speaker (native model checkpoint key or cached audio)
+    spk = (speaker_name or speaker or speaker_id or "").strip()
+    ref_audio_path = None
+    if spk and spk in GLOBAL_SPEAKER_CACHE and os.path.isfile(GLOBAL_SPEAKER_CACHE[spk]):
+        ref_audio_path = GLOBAL_SPEAKER_CACHE[spk]
+    elif GLOBAL_SPEAKER_CACHE.get("active_speaker") in GLOBAL_SPEAKER_CACHE:
+        active_path = GLOBAL_SPEAKER_CACHE[GLOBAL_SPEAKER_CACHE["active_speaker"]]
+        if os.path.isfile(active_path):
+            ref_audio_path = active_path
 
     # 2. Stage temporary output
     temp_dir = Path(tempfile.mkdtemp(prefix="xtts_line_"))
@@ -385,6 +436,7 @@ async def synthesize_line(
                     ref_audio_path=ref_audio_path,
                     language=clean_lang,
                     output_path=str(output_audio_path),
+                    speaker_name=spk if not ref_audio_path else None,
                 )
         except Exception as synth_err:
             raise HTTPException(

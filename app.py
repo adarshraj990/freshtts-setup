@@ -236,119 +236,138 @@ def fit_audio_to_slot(seg: AudioSegment, slot_duration_ms: int, max_speedup: flo
             return seg
 
 
-def get_cache_key(text: str, language: str, voice_hash: str) -> str:
+# ── Native Model Speakers Configuration (Indic / Bhojpuri Checkpoint) ───────
+
+DEFAULT_NATIVE_SPEAKERS: List[Tuple[str, str]] = [
+    ("🎭 Bhojpuri Male 1 (Deep Narrative)", "bhojpuri_male_1"),
+    ("🎙️ Bhojpuri Male 2 (Conversational)", "bhojpuri_male_2"),
+    ("🌸 Bhojpuri Female 1 (Warm & Melodic)", "bhojpuri_female_1"),
+    ("✨ Bhojpuri Female 2 (Expressive Dramatic)", "bhojpuri_female_2"),
+    ("🎬 Hindi Male 1 (Heroic / Anime Lead)", "hindi_male_1"),
+    ("📢 Hindi Male 2 (Deep Commercial)", "hindi_male_2"),
+    ("🎀 Hindi Female 1 (Anime Heroine)", "hindi_female_1"),
+    ("🌟 Hindi Female 2 (Natural Narration)", "hindi_female_2"),
+    ("⚡ Model Default Native Speaker", "default_speaker"),
+]
+
+
+def get_cache_key(text: str, language: str, speaker_name: str) -> str:
     """Computes a unique MD5 hash key for caching speech audio."""
-    raw = f"{text}|{language}|{voice_hash}"
+    raw = f"{text}|{language}|{speaker_name}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-# ── One-Time Speaker Registration on Backend ─────────────────────────────────
-
-def register_speaker_on_backend(
-    endpoint_base: str,
-    ref_audio_path: str,
-    timeout_sec: int = 60,
-) -> Tuple[bool, Optional[str], Optional[str]]:
+def fetch_speakers_from_backend(kaggle_url: str):
     """
-    Sends the reference audio file ONCE to the backend endpoint '/register_speaker'.
-    The backend caches conditioning latents in GPU memory for all subsequent chunks.
-    Returns: (success: bool, speaker_id: str, error_message: str)
+    Queries the remote backend endpoint (/speakers or /get_speakers) to fetch
+    the native pre-trained speakers available in the fine-tuned Indic/Bhojpuri checkpoint.
+    Returns: (gr.update(choices=..., value=...), status_message: str)
     """
-    clean_base = endpoint_base.rstrip("/")
-    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker"]:
-        if clean_base.endswith(subpath):
-            clean_base = clean_base[:-len(subpath)].rstrip("/")
+    raw_url = (kaggle_url or "").strip()
+    if not raw_url:
+        return gr.update(choices=DEFAULT_NATIVE_SPEAKERS, value=DEFAULT_NATIVE_SPEAKERS[0][1]), "⚪ *Enter your Kaggle API URL to query checkpoint speakers.*"
 
-    url = f"{clean_base}/register_speaker"
-    filename = Path(ref_audio_path).name
-    mime_type = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = f"https://{raw_url}"
+    clean_url = raw_url.rstrip("/")
+    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker", "/speakers", "/get_speakers"]:
+        if clean_url.endswith(subpath):
+            clean_url = clean_url[:-len(subpath)].rstrip("/")
 
     try:
-        with open(ref_audio_path, "rb") as f:
-            files = {"speaker_wav": (filename, f, mime_type)}
-            data = {"speaker_id": f"spk_{Path(ref_audio_path).stem[:12]}"}
-            resp = SESSION.post(
-                url,
-                headers=TUNNEL_HEADERS,
-                files=files,
-                data=data,
-                timeout=timeout_sec,
-            )
-
+        resp = SESSION.get(
+            f"{clean_url}/speakers",
+            headers=TUNNEL_HEADERS,
+            timeout=8,
+        )
         if resp.status_code == 200:
-            try:
-                res_data = resp.json()
-                sid = res_data.get("speaker_id") or "active_speaker"
-                return True, sid, None
-            except Exception:
-                return True, "active_speaker", None
-        else:
-            return False, None, f"HTTP {resp.status_code}: {resp.text[:120]}"
+            data = resp.json()
+            raw_list = data.get("speakers") or data.get("speaker_names") or data
+            if isinstance(raw_list, list) and raw_list:
+                choices = []
+                for s in raw_list:
+                    if isinstance(s, dict):
+                        sid = str(s.get("id") or s.get("name") or s)
+                        label = str(s.get("label") or s.get("name") or sid)
+                    else:
+                        sid = str(s)
+                        label = sid
+                    low = label.lower()
+                    if "female" in low or "woman" in low or "f_" in low or "stree" in low:
+                        icon = "🌸"
+                    elif "male" in low or "man" in low or "m_" in low or "purush" in low:
+                        icon = "🎙️"
+                    else:
+                        icon = "🗣️"
+                    choices.append((f"{icon} {label}", sid))
+                val = choices[0][1]
+                return gr.update(choices=choices, value=val), f"✅ *Successfully fetched {len(choices)} native checkpoint speakers from backend!*"
+
+        # Fallback to /get_speakers
+        resp2 = SESSION.get(
+            f"{clean_url}/get_speakers",
+            headers=TUNNEL_HEADERS,
+            timeout=5,
+        )
+        if resp2.status_code == 200:
+            data2 = resp2.json()
+            raw_list2 = data2.get("speakers") or data2
+            if isinstance(raw_list2, list) and raw_list2:
+                choices = [(f"🗣️ {str(s)}", str(s)) for s in raw_list2]
+                return gr.update(choices=choices, value=choices[0][1]), f"✅ *Loaded {len(choices)} speakers from backend.*"
 
     except Exception as e:
-        return False, None, str(e)
+        safe_print(f"Notice: /speakers query: {e}")
+
+    return gr.update(choices=DEFAULT_NATIVE_SPEAKERS, value=DEFAULT_NATIVE_SPEAKERS[0][1]), "✨ *Ready with Indic/Bhojpuri pre-trained male & female speaker profiles.*"
 
 
-# ── Ultra-Fast Chunk Synthesis with Automated 3-Attempt Retry ────────────────
+# ── Ultra-Fast Native Line Synthesis with Automated 3-Attempt Retry ──────────
 
 def synthesize_line_with_retry(
     endpoint_base: str,
     text: str,
     language: str,
-    speaker_id: Optional[str] = None,
-    ref_audio_path: Optional[str] = None,
-    use_cached_speaker: bool = True,
+    speaker_name: str,
     timeout_sec: int = 120,
     max_retries: int = 3,
     retry_delay_sec: float = 2.0,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    Dispatches a single subtitle line to the backend with automated retry.
-    - If use_cached_speaker is True: calls /synthesize_line sending ONLY text + language (no audio upload).
-    - If fallback is needed: calls /voice_clone_synthesis with full audio upload.
+    Dispatches a single subtitle line to the backend /synthesize_line endpoint with automated retry.
+    Payload:
+      - text: Subtitle line
+      - speaker_name: Selected speaker ID from the fine-tuned Indic/Bhojpuri checkpoint
+      - speaker_id: Backward compatibility
+      - language: Target language ('hi', 'bho', etc.)
+    Completely bypasses uploading reference WAV files since speaker embeddings exist natively in model weights.
     """
     clean_base = endpoint_base.rstrip("/")
-    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker"]:
+    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker", "/speakers", "/get_speakers"]:
         if clean_base.endswith(subpath):
             clean_base = clean_base[:-len(subpath)].rstrip("/")
 
     data = {
         "text": text,
         "text_chunk": text,
+        "speaker_name": speaker_name,
+        "speaker_id": speaker_name,
+        "speaker": speaker_name,
         "language": language,
         "target_lang": language,
     }
-    if speaker_id:
-        data["speaker_id"] = speaker_id
 
     last_error = "Unknown error"
 
     for attempt in range(1, max_retries + 1):
         try:
-            if use_cached_speaker:
-                target_url = f"{clean_base}/synthesize_line"
-                resp = SESSION.post(
-                    target_url,
-                    headers=TUNNEL_HEADERS,
-                    data=data,
-                    timeout=timeout_sec,
-                )
-            else:
-                target_url = f"{clean_base}/voice_clone_synthesis"
-                filename = Path(ref_audio_path).name
-                mime_type = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
-                with open(ref_audio_path, "rb") as f1, open(ref_audio_path, "rb") as f2:
-                    files = [
-                        ("speaker_wav", (filename, f1, mime_type)),
-                        ("reference_voice", (filename, f2, mime_type)),
-                    ]
-                    resp = SESSION.post(
-                        target_url,
-                        headers=TUNNEL_HEADERS,
-                        data=data,
-                        files=files,
-                        timeout=timeout_sec,
-                    )
+            target_url = f"{clean_base}/synthesize_line"
+            resp = SESSION.post(
+                target_url,
+                headers=TUNNEL_HEADERS,
+                data=data,
+                timeout=timeout_sec,
+            )
 
             if resp.status_code == 200:
                 content_type = resp.headers.get("content-type", "").lower()
@@ -502,17 +521,16 @@ def run_high_throughput_srt_pipeline(
     kaggle_url: str,
     srt_file: Optional[str],
     language_code: str,
-    use_default_voice: bool,
-    custom_voice_file: Optional[str],
+    speaker_name: str,
     concurrent_workers: int = 4,
     progress=gr.Progress(track_tqdm=False),
 ):
     """
-    Ultra-Fast Time-Synchronized Dual-GPU SRT Dubbing Engine:
-    1. One-Time Speaker Registration: Caches speaker conditioning latents once on backend.
+    Ultra-Fast Time-Synchronized Dual-GPU SRT Dubbing Engine for Native Model Speakers:
+    1. Native Model Speaker Selection: Uses fine-tuned Indic/Bhojpuri checkpoint weights (no audio upload).
     2. 4 Simultaneous Parallel Dispatches: ThreadPoolExecutor(max_workers=4) saturates 2x T4 GPUs.
     3. Non-Blocking Async Collection: as_completed() collects results without sequential stalling.
-    4. Exact SRT Order Memory Dictionary: results[chunk_id] = (start_ms, audio_segment).
+    4. Exact SRT Order Memory Dictionary: results[chunk_id] = audio_segment.
     5. Dead Silence Stripping & Slot-Fitting: Trims dead silence (-40 dBFS) & fits duration slot.
     6. Exact Timeline Alignment: Overlays chunks onto an empty master canvas of total video duration.
     7. Real-Time Telemetry: Live lines/sec, elapsed time, and ETA tracking.
@@ -529,7 +547,7 @@ def run_high_throughput_srt_pipeline(
         safe_print(entry)
 
     t_start = time.time()
-    log("🚀 Initializing Saturated 4-Worker Parallel SRT Dubbing Pipeline...")
+    log("🚀 Initializing Indic/Bhojpuri Native Speaker Dubbing Pipeline...")
 
     # 1. Validate & Sanitize Kaggle API URL
     if not kaggle_url or not kaggle_url.strip():
@@ -538,47 +556,17 @@ def run_high_throughput_srt_pipeline(
         raise gr.Error(err)
 
     clean_url = kaggle_url.strip().rstrip("/")
-    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker"]:
+    for subpath in ["/voice_clone_synthesis", "/synthesize_line", "/register_speaker", "/speakers", "/get_speakers"]:
         if clean_url.endswith(subpath):
             clean_url = clean_url[:-len(subpath)].rstrip("/")
 
     log(f"🌐 Backend Host: `{clean_url}`")
 
-    # 2. Resolve Reference Voice Audio & Hash
-    if use_default_voice:
-        if os.path.isfile(DEFAULT_REFERENCE_VOICE):
-            ref_path = DEFAULT_REFERENCE_VOICE
-            log(f"🎙️ Using Default Voice: `{Path(ref_path).name}` ({os.path.getsize(ref_path)/(1024*1024):.2f} MB)")
-        else:
-            err = "Built-in reference_voice.wav was not found in the root directory!"
-            log(f"❌ {err}")
-            raise gr.Error(err)
-    else:
-        if not custom_voice_file or not os.path.isfile(custom_voice_file):
-            err = "Please upload a reference voice sample or tick 'Use Default Voice (reference_voice.wav)'!"
-            log(f"❌ {err}")
-            raise gr.Error(err)
-        ref_path = custom_voice_file
-        log(f"🎙️ Using Custom Voice: `{Path(ref_path).name}` ({os.path.getsize(ref_path)/(1024*1024):.2f} MB)")
+    # 2. Resolve Selected Speaker
+    spk = (speaker_name or "bhojpuri_male_1").strip()
+    log(f"🎙️ Model Native Speaker: **{spk}** (Zero audio upload, pre-trained weights)")
 
-    # Compute voice file MD5 for cache invalidation
-    with open(ref_path, "rb") as vf:
-        voice_hash = hashlib.md5(vf.read(1024 * 512)).hexdigest()
-
-    # 3. One-Time Speaker Registration (/register_speaker)
-    log(f"⚡ Registering reference voice once on backend: `{clean_url}/register_speaker`...")
-    reg_ok, sid, reg_err = register_speaker_on_backend(clean_url, ref_path, timeout_sec=60)
-
-    if reg_ok:
-        log(f"✅ One-Time Speaker Registration Succeeded! Speaker ID: `{sid}`.")
-        log("🚀 Speaker audio cached in GPU memory. Subtitle lines will send TEXT ONLY without re-uploading audio!")
-        use_cached_speaker = True
-    else:
-        log(f"⚠️ Speaker registration note: {reg_err}. Falling back to standard multi-part upload mode.")
-        use_cached_speaker = False
-        sid = None
-
-    # 4. Parse and Clean SRT Subtitles
+    # 3. Parse and Clean SRT Subtitles
     if not srt_file or not os.path.isfile(srt_file):
         err = "Please upload a valid .srt subtitle file!"
         log(f"❌ {err}")
@@ -636,7 +624,7 @@ def run_high_throughput_srt_pipeline(
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    # 5. Saturated 4-Worker Parallel Execution (concurrent.futures.ThreadPoolExecutor max_workers=4)
+    # 4. Saturated 4-Worker Parallel Execution (concurrent.futures.ThreadPoolExecutor max_workers=4)
     num_workers = int(concurrent_workers) if (concurrent_workers and int(concurrent_workers) >= 2) else 4
     log(f"⚡ Firing {num_workers} simultaneous requests across ThreadPoolExecutor(max_workers={num_workers}) to saturate Dual-GPUs...")
 
@@ -651,7 +639,7 @@ def run_high_throughput_srt_pipeline(
     def process_sub_block(chunk_info: Tuple[int, int, int, int, str]) -> Tuple[int, Optional[AudioSegment], Optional[str]]:
         nonlocal cache_hits
         idx, start_ms, end_ms, slot_duration_ms, text = chunk_info
-        cache_key = get_cache_key(text, lang, voice_hash)
+        cache_key = get_cache_key(text, lang, spk)
 
         # 1. Check in-memory cache
         with CACHE_LOCK:
@@ -671,9 +659,7 @@ def run_high_throughput_srt_pipeline(
             endpoint_base=clean_url,
             text=text,
             language=lang,
-            speaker_id=sid,
-            ref_audio_path=ref_path,
-            use_cached_speaker=use_cached_speaker,
+            speaker_name=spk,
             timeout_sec=120,
             max_retries=3,
             retry_delay_sec=2.0,
@@ -795,14 +781,14 @@ def build_app() -> gr.Blocks:
 
     initial_choices, initial_table, initial_latest = get_history_records()
 
-    with gr.Blocks(theme=theme, title="🎬 Saturated Dual-GPU SRT Dubbing Studio") as demo:
+    with gr.Blocks(theme=theme, title="🎬 Indic / Bhojpuri Dual-GPU SRT Dubbing Studio") as demo:
         # Header Banner
         gr.Markdown(
             """
-            # 🎬 Saturated Dual-GPU SRT Voice Cloning Studio
-            ### ⚡ Ultra-Fast Parallel Subtitle Auto-Dubbing via Remote Kaggle Dual T4 GPUs
-            **One-Time Speaker Caching (/register_speaker)**: Reference audio is uploaded once to GPU memory. 
-            All subtitle lines are dispatched simultaneously via **4 concurrent workers** to /synthesize_line with full sentence prosody, dead silence stripping (-40 dBFS), slot-fitting time stretch, 3-attempt auto-retry, and persistent exports gallery.
+            # 🎬 Indic / Bhojpuri Dual-GPU SRT Dubbing Studio
+            ### ⚡ Ultra-Fast Parallel Subtitle Auto-Dubbing with Native Model Speakers
+            **Pre-Trained Indic/Bhojpuri Speakers**: Select from native male and female checkpoint voices directly.
+            Bypasses external audio uploads completely. All subtitle lines are dispatched simultaneously via **4 concurrent workers** to `/synthesize_line` (`text`, `speaker_name`, `language`) with full sentence prosody, dead silence stripping (-40 dBFS), slot-fitting time stretch, 3-attempt auto-retry, and persistent exports gallery.
             """
         )
 
@@ -834,6 +820,7 @@ def build_app() -> gr.Blocks:
                     label="Target Language Code",
                     choices=[
                         ("Hindi (hi)", "hi"),
+                        ("Bhojpuri (bho)", "bho"),
                         ("English (en)", "en"),
                         ("Spanish (es)", "es"),
                         ("French (fr)", "fr"),
@@ -846,34 +833,23 @@ def build_app() -> gr.Blocks:
                         ("Korean (ko)", "ko"),
                     ],
                     value="hi",
-                    info="Language for XTTS-v2 voice synthesis.",
+                    info="Language for native voice synthesis ('hi' or 'bho').",
                 )
 
                 with gr.Group():
-                    use_default_voice_cb = gr.Checkbox(
-                        label="🎯 Use Default Voice (reference_voice.wav)",
-                        value=True,
-                        info="When ticked, automatically uses the root reference_voice.wav file.",
-                    )
+                    with gr.Row():
+                        speaker_dropdown = gr.Dropdown(
+                            label="🎙️ Native Model Speaker (Fine-Tuned Indic / Bhojpuri)",
+                            choices=DEFAULT_NATIVE_SPEAKERS,
+                            value="bhojpuri_male_1",
+                            allow_custom_value=True,
+                            interactive=True,
+                            scale=8,
+                            info="Select a pre-trained male or female voice, or enter a custom speaker key.",
+                        )
+                        refresh_speakers_btn = gr.Button("🔄 Query Speakers", variant="secondary", scale=3)
 
-                    custom_voice_input = gr.Audio(
-                        label="Custom Reference Voice (Upload or Record)",
-                        type="filepath",
-                        value=DEFAULT_REFERENCE_VOICE if os.path.isfile(DEFAULT_REFERENCE_VOICE) else None,
-                    )
-
-                def on_toggle_voice(is_checked: bool):
-                    if is_checked:
-                        val = DEFAULT_REFERENCE_VOICE if os.path.isfile(DEFAULT_REFERENCE_VOICE) else None
-                        return gr.update(value=val, interactive=False)
-                    else:
-                        return gr.update(value=None, interactive=True)
-
-                use_default_voice_cb.change(
-                    fn=on_toggle_voice,
-                    inputs=[use_default_voice_cb],
-                    outputs=[custom_voice_input],
-                )
+                    speaker_status_box = gr.Markdown("💡 *Model checkpoint pre-trained voice embeddings selected (zero audio upload latency).*")
 
                 with gr.Accordion("⚙️ Dual-GPU Concurrency Tuning", open=False):
                     workers_slider = gr.Slider(
@@ -958,6 +934,13 @@ def build_app() -> gr.Blocks:
             outputs=[conn_status_box],
         )
 
+        # Refresh / Query Model Speakers from Backend
+        refresh_speakers_btn.click(
+            fn=fetch_speakers_from_backend,
+            inputs=[kaggle_url_input],
+            outputs=[speaker_dropdown, speaker_status_box],
+        )
+
         # Main Synthesis Pipeline
         submit_btn.click(
             fn=run_high_throughput_srt_pipeline,
@@ -965,8 +948,7 @@ def build_app() -> gr.Blocks:
                 kaggle_url_input,
                 srt_file_input,
                 language_dropdown,
-                use_default_voice_cb,
-                custom_voice_input,
+                speaker_dropdown,
                 workers_slider,
             ],
             outputs=[
