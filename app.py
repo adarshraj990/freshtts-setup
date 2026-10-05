@@ -8,9 +8,11 @@ Key Features & Pipeline Architecture:
    - Reference audio uploaded ONCE to backend before batch dubbing.
    - Conditioning latents cached in GPU memory on Kaggle dual T4 GPUs.
    - Subtitle chunks call /synthesize_line sending ONLY text + language (no re-uploading).
-2. Dual-GPU Saturation & Auto-Retry:
-   - ThreadPoolExecutor(max_workers=2) parallel dispatch.
-   - 3-attempt retry loop with 2.0s backoff for network drops.
+2. Parallel Dual-GPU Saturation (ThreadPoolExecutor max_workers=4):
+   - Fires 4 simultaneous requests to /synthesize_line to fully saturate 2x T4 GPUs.
+   - Persistent requests.Session with connection pooling (pool_connections=20).
+   - Asynchronous collection via concurrent.futures.as_completed() without sequential stalls.
+   - 3-attempt automated retry loop with 2.0s backoff for network drops.
 3. Complete Line Generation & SRT Time-Sync:
    - Full subtitle lines (natural emotion/prosody).
    - Silence stripping via pydub.silence (-40 dBFS threshold).
@@ -23,6 +25,7 @@ Key Features & Pipeline Architecture:
 """
 
 import base64
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import hashlib
@@ -131,6 +134,7 @@ from pydub.silence import detect_leading_silence
 from pydub.effects import speedup
 import pysrt
 import requests
+from requests.adapters import HTTPAdapter
 
 # Base Paths & Directories
 BASE_DIR = Path(__file__).resolve().parent
@@ -143,8 +147,18 @@ TUNNEL_HEADERS = {
     "Bypass-Tunnel-Reminder": "true",
     "bypass-tunnel-reminder": "true",
     "ngrok-skip-browser-warning": "true",
-    "User-Agent": "AudioGenFlow-DualGPU-Client/2.5",
+    "User-Agent": "AudioGenFlow-DualGPU-Client/3.0",
 }
+
+# Shared HTTP Session with Connection Pooling for Ultra-Fast Parallel Requests
+SESSION = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=20,
+    max_retries=0,
+)
+SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
 
 # In-Memory Cache for Idempotent Operations (Thread-Safe)
 AUDIO_CACHE: Dict[str, bytes] = {}
@@ -253,7 +267,7 @@ def register_speaker_on_backend(
         with open(ref_audio_path, "rb") as f:
             files = {"speaker_wav": (filename, f, mime_type)}
             data = {"speaker_id": f"spk_{Path(ref_audio_path).stem[:12]}"}
-            resp = requests.post(
+            resp = SESSION.post(
                 url,
                 headers=TUNNEL_HEADERS,
                 files=files,
@@ -313,7 +327,7 @@ def synthesize_line_with_retry(
         try:
             if use_cached_speaker:
                 target_url = f"{clean_base}/synthesize_line"
-                resp = requests.post(
+                resp = SESSION.post(
                     target_url,
                     headers=TUNNEL_HEADERS,
                     data=data,
@@ -328,7 +342,7 @@ def synthesize_line_with_retry(
                         ("speaker_wav", (filename, f1, mime_type)),
                         ("reference_voice", (filename, f2, mime_type)),
                     ]
-                    resp = requests.post(
+                    resp = SESSION.post(
                         target_url,
                         headers=TUNNEL_HEADERS,
                         data=data,
@@ -417,7 +431,7 @@ def check_connection_health(api_url: str):
     t0 = time.time()
     try:
         # Ping root URL with 7-second timeout and tunnel bypass headers
-        resp = requests.get(
+        resp = SESSION.get(
             f"{root_url}/",
             headers=TUNNEL_HEADERS,
             timeout=7,
@@ -490,18 +504,19 @@ def run_high_throughput_srt_pipeline(
     language_code: str,
     use_default_voice: bool,
     custom_voice_file: Optional[str],
-    concurrent_workers: int = 2,
+    concurrent_workers: int = 4,
     progress=gr.Progress(track_tqdm=False),
 ):
     """
     Ultra-Fast Time-Synchronized Dual-GPU SRT Dubbing Engine:
     1. One-Time Speaker Registration: Caches speaker conditioning latents once on backend.
-    2. Full-Sentence Processing: Sends complete, natural subtitle lines (text-only).
-    3. SRT Time-Sync & Silence Stripping: Trims dead silence (-40 dBFS) & fits duration slot.
-    4. Exact Timeline Alignment: Overlays chunks onto an empty master canvas of total video duration.
-    5. Dual-GPU Saturation: 2 concurrent workers saturate dual T4 GPUs with 3-attempt retry loop.
-    6. Real-Time Telemetry: Live lines/sec, elapsed time, and ETA tracking.
-    7. Persistent History: Automatically registers output in local exports gallery.
+    2. 4 Simultaneous Parallel Dispatches: ThreadPoolExecutor(max_workers=4) saturates 2x T4 GPUs.
+    3. Non-Blocking Async Collection: as_completed() collects results without sequential stalling.
+    4. Exact SRT Order Memory Dictionary: results[chunk_id] = (start_ms, audio_segment).
+    5. Dead Silence Stripping & Slot-Fitting: Trims dead silence (-40 dBFS) & fits duration slot.
+    6. Exact Timeline Alignment: Overlays chunks onto an empty master canvas of total video duration.
+    7. Real-Time Telemetry: Live lines/sec, elapsed time, and ETA tracking.
+    8. Persistent History: Automatically registers output in local exports gallery.
     """
     logs: List[str] = []
     log_lock = threading.Lock()
@@ -514,7 +529,7 @@ def run_high_throughput_srt_pipeline(
         safe_print(entry)
 
     t_start = time.time()
-    log("🚀 Initializing Ultra-Fast Time-Synchronized SRT Dubbing Pipeline...")
+    log("🚀 Initializing Saturated 4-Worker Parallel SRT Dubbing Pipeline...")
 
     # 1. Validate & Sanitize Kaggle API URL
     if not kaggle_url or not kaggle_url.strip():
@@ -621,33 +636,37 @@ def run_high_throughput_srt_pipeline(
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    # 5. Saturated Dual-GPU Execution (ThreadPoolExecutor)
-    num_workers = max(1, min(int(concurrent_workers), 4))
-    log(f"⚡ Launching Saturated Dual-GPU Worker Pool with **{num_workers} concurrent threads**...")
+    # 5. Saturated 4-Worker Parallel Execution (concurrent.futures.ThreadPoolExecutor max_workers=4)
+    num_workers = int(concurrent_workers) if (concurrent_workers and int(concurrent_workers) >= 2) else 4
+    log(f"⚡ Firing {num_workers} simultaneous requests across ThreadPoolExecutor(max_workers={num_workers}) to saturate Dual-GPUs...")
 
-    generated_segments: Dict[int, Tuple[int, AudioSegment]] = {}
+    # Map chunk_id to its exact start_time_ms on the SRT timeline
+    chunk_timestamps: Dict[int, int] = {chunk[0]: chunk[1] for chunk in cleaned_chunks}
+    # Maintain original subtitle order in an in-memory dictionary: results[chunk_id] = audio_segment
+    results: Dict[int, AudioSegment] = {}
     completed_chunks = 0
     cache_hits = 0
     lang = language_code.strip().lower()
 
-    def process_sub_block(chunk_info: Tuple[int, int, int, int, str]) -> Tuple[int, int, Optional[AudioSegment], Optional[str]]:
+    def process_sub_block(chunk_info: Tuple[int, int, int, int, str]) -> Tuple[int, Optional[AudioSegment], Optional[str]]:
         nonlocal cache_hits
         idx, start_ms, end_ms, slot_duration_ms, text = chunk_info
         cache_key = get_cache_key(text, lang, voice_hash)
 
         # 1. Check in-memory cache
         with CACHE_LOCK:
-            if cache_key in AUDIO_CACHE:
-                cached_bytes = AUDIO_CACHE[cache_key]
-                seg = AudioSegment.from_file(io.BytesIO(cached_bytes))
-                seg = seg.set_frame_rate(24000).set_channels(1)
-                seg = strip_dead_silence(seg, threshold=-40.0)
-                seg = fit_audio_to_slot(seg, slot_duration_ms=slot_duration_ms)
-                if len(seg) > 30:
-                    seg = seg.fade_in(10).fade_out(10)
-                return idx, start_ms, seg, "CACHE_HIT"
+            cached_bytes = AUDIO_CACHE.get(cache_key)
 
-        # 2. Remote Dual-GPU Synthesis Call
+        if cached_bytes:
+            seg = AudioSegment.from_file(io.BytesIO(cached_bytes))
+            seg = seg.set_frame_rate(24000).set_channels(1)
+            seg = strip_dead_silence(seg, threshold=-40.0)
+            seg = fit_audio_to_slot(seg, slot_duration_ms=slot_duration_ms)
+            if len(seg) > 30:
+                seg = seg.fade_in(10).fade_out(10)
+            return idx, seg, "CACHE_HIT"
+
+        # 2. Remote Dual-GPU Synthesis Call to Kaggle /synthesize_line
         audio_bytes, err = synthesize_line_with_retry(
             endpoint_base=clean_url,
             text=text,
@@ -672,20 +691,22 @@ def run_high_throughput_srt_pipeline(
                 if len(seg) > 30:
                     seg = seg.fade_in(10).fade_out(10)
 
-                return idx, start_ms, seg, None
+                return idx, seg, None
             except Exception as dec_err:
-                return idx, start_ms, None, f"Audio decode error: {dec_err}"
+                return idx, None, f"Audio decode error: {dec_err}"
         else:
-            return idx, start_ms, None, err or "Empty audio response"
+            return idx, None, err or "Empty audio response"
 
-    # Dispatch tasks across ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    # Submit ALL jobs to executor simultaneously without waiting in a sequential loop
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         future_to_chunk = {
-            executor.submit(process_sub_block, chunk): chunk for chunk in cleaned_chunks
+            executor.submit(process_sub_block, chunk): chunk
+            for chunk in cleaned_chunks
         }
 
-        for future in as_completed(future_to_chunk):
-            sub_idx, start_ms, seg, status = future.result()
+        # Asynchronously collect results as each completes using concurrent.futures.as_completed()
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            sub_idx, seg, status = future.result()
             completed_chunks += 1
             progress_ratio = completed_chunks / total_chunks
 
@@ -703,30 +724,32 @@ def run_high_throughput_srt_pipeline(
             )
 
             if seg is not None:
-                generated_segments[sub_idx] = (start_ms, seg)
+                # Maintain original subtitle order in an in-memory dictionary: results[chunk_id] = audio_segment
+                results[sub_idx] = seg
                 if status == "CACHE_HIT":
                     cache_hits += 1
                     log(f"⚡ [Line #{sub_idx}/{total_chunks}] Cache Hit (0ms) | {throughput:.2f} lines/s | Elapsed: {elapsed_str} | ETA: {eta_str}")
                 else:
-                    log(f"✅ [Line #{sub_idx}/{total_chunks}] Synced | {throughput:.2f} lines/s | Elapsed: {elapsed_str} | ETA: {eta_str}")
+                    log(f"✅ [Line #{sub_idx}/{total_chunks}] Synced ({len(seg)}ms) | {throughput:.2f} lines/s | Elapsed: {elapsed_str} | ETA: {eta_str}")
             else:
                 log(f"⚠️ [Line #{sub_idx}/{total_chunks}] Failed: {status} | Elapsed: {elapsed_str} | ETA: {eta_str}")
 
-    # 6. Precise Master Audio Timeline Assembly
+    # 6. Precise Master Audio Timeline Assembly in Original Subtitle Order
     progress(0.95, desc="Overlaying audio segments onto master video timeline...")
-    log(f"🎼 Assembling {len(generated_segments)} segments onto {timeline_mins}m {timeline_secs}s silent master canvas...")
+    log(f"🎼 Assembling {len(results)} segments strictly in original SRT order onto {timeline_mins}m {timeline_secs}s canvas...")
 
-    if not generated_segments:
+    if not results:
         err = "All subtitle segments failed to synthesize. Please check your Kaggle GPU notebook logs."
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    # Create empty master AudioSegment matching total video duration
+    # Empty silent master track matching total video duration
     master_canvas = AudioSegment.silent(duration=total_video_duration_ms, frame_rate=24000).set_channels(1)
 
-    # Place each segment at its exact start_time_ms
-    for idx in sorted(generated_segments.keys()):
-        start_ms, seg = generated_segments[idx]
+    # Place each segment strictly at its exact start_time_ms
+    for chunk_id in sorted(results.keys()):
+        seg = results[chunk_id]
+        start_ms = chunk_timestamps[chunk_id]
         master_canvas = master_canvas.overlay(seg, position=start_ms)
 
     # 7. Direct Export to outputs/ directory (Permanent storage)
@@ -738,7 +761,7 @@ def run_high_throughput_srt_pipeline(
     final_file_size_mb = output_path.stat().st_size / (1024 * 1024)
 
     # Free memory buffers immediately
-    del generated_segments
+    del results
     del master_canvas
 
     total_time = time.time() - t_start
@@ -777,9 +800,9 @@ def build_app() -> gr.Blocks:
         gr.Markdown(
             """
             # 🎬 Saturated Dual-GPU SRT Voice Cloning Studio
-            ### ⚡ Ultra-Fast Time-Synchronized Subtitle Auto-Dubbing via Remote Kaggle Dual T4 GPUs
+            ### ⚡ Ultra-Fast Parallel Subtitle Auto-Dubbing via Remote Kaggle Dual T4 GPUs
             **One-Time Speaker Caching (/register_speaker)**: Reference audio is uploaded once to GPU memory. 
-            All subtitle lines send lightweight text-only requests (/synthesize_line) with full sentence prosody, dead silence stripping (-40 dBFS), slot-fitting time stretch, 3-attempt auto-retry, and persistent exports gallery.
+            All subtitle lines are dispatched simultaneously via **4 concurrent workers** to /synthesize_line with full sentence prosody, dead silence stripping (-40 dBFS), slot-fitting time stretch, 3-attempt auto-retry, and persistent exports gallery.
             """
         )
 
@@ -855,14 +878,14 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("⚙️ Dual-GPU Concurrency Tuning", open=False):
                     workers_slider = gr.Slider(
                         label="Concurrent ThreadPool Workers",
-                        minimum=1,
-                        maximum=4,
-                        value=2,
+                        minimum=2,
+                        maximum=8,
+                        value=4,
                         step=1,
-                        info="2 workers perfectly saturates 2x T4 GPUs on Kaggle without overloading worker locks.",
+                        info="4 simultaneous workers fully saturates 2x T4 GPUs on Kaggle, eliminating idle wait time.",
                     )
 
-                submit_btn = gr.Button("🚀 Start Ultra-Fast Time-Synced Dubbing", variant="primary", size="lg")
+                submit_btn = gr.Button("🚀 Start Ultra-Fast Parallel Dubbing", variant="primary", size="lg")
 
             # RIGHT COLUMN: Audio Output & Live Throughput Logs
             with gr.Column(scale=5):
