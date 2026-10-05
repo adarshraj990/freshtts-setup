@@ -285,7 +285,138 @@ async def health_check():
     }
 
 
-# ── Voice Clone Synthesis Endpoint ───────────────────────────────────────────
+# ── One-Time Speaker Registration & Fast Synthesis Endpoints ─────────────────
+
+GLOBAL_SPEAKER_CACHE: Dict[str, str] = {}
+
+
+@app.post("/register_speaker")
+async def register_speaker(
+    speaker_wav: Optional[UploadFile] = File(None),
+    reference_voice: Optional[UploadFile] = File(None),
+    speaker_id: Optional[str] = Form(None),
+):
+    """
+    Caches speaker reference audio once on the backend.
+    Enables all subsequent subtitle chunks to call /synthesize_line without re-uploading audio.
+    """
+    ref_file = speaker_wav if speaker_wav is not None else reference_voice
+    if ref_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Speaker reference audio file ('speaker_wav' or 'reference_voice') is required.",
+        )
+
+    content = await ref_file.read()
+    if not content or len(content) < 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded speaker audio file is empty or corrupted.",
+        )
+
+    # Derive speaker ID
+    import hashlib
+    sid = speaker_id.strip() if (speaker_id and speaker_id.strip()) else f"spk_{hashlib.md5(content[:2048]).hexdigest()[:8]}"
+
+    speaker_dir = Path(tempfile.gettempdir()) / "xtts_speaker_cache"
+    speaker_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = speaker_dir / f"{sid}.wav"
+
+    with open(saved_path, "wb") as f:
+        f.write(content)
+
+    GLOBAL_SPEAKER_CACHE[sid] = str(saved_path)
+    GLOBAL_SPEAKER_CACHE["active_speaker"] = sid
+
+    logger.info(f"✅ Registered and cached speaker audio '{sid}' at: {saved_path}")
+
+    return {
+        "status": "registered",
+        "speaker_id": sid,
+        "message": f"Speaker audio '{sid}' cached in backend memory.",
+        "size_bytes": len(content),
+    }
+
+
+@app.post("/synthesize_line")
+async def synthesize_line(
+    text: Optional[str] = Form(None),
+    text_chunk: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    target_lang: Optional[str] = Form(None),
+    speaker_id: Optional[str] = Form(None),
+):
+    """
+    Ultra-fast single line synthesis using pre-cached speaker audio.
+    Requires NO audio file upload over the network tunnel!
+    """
+    # 1. Input Validation
+    raw_text = text if (text is not None and text.strip()) else text_chunk
+    if not raw_text or not raw_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Validation Error: 'text' or 'text_chunk' cannot be empty or whitespace-only.",
+        )
+    clean_text = raw_text.strip()
+
+    raw_lang = language if language else target_lang
+    clean_lang = (raw_lang or "hi").strip().lower()
+
+    # Resolve cached speaker
+    sid = speaker_id.strip() if (speaker_id and speaker_id.strip()) else GLOBAL_SPEAKER_CACHE.get("active_speaker")
+    if not sid or sid not in GLOBAL_SPEAKER_CACHE or not os.path.isfile(GLOBAL_SPEAKER_CACHE[sid]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No speaker audio registered on backend. Call /register_speaker first.",
+        )
+    ref_audio_path = GLOBAL_SPEAKER_CACHE[sid]
+
+    # 2. Stage temporary output
+    temp_dir = Path(tempfile.mkdtemp(prefix="xtts_line_"))
+    output_audio_path = temp_dir / f"line_{uuid.uuid4().hex[:8]}.wav"
+
+    try:
+        worker: GPUWorker = await gpu_queue.get()
+        try:
+            async with worker.async_lock:
+                await asyncio.to_thread(
+                    worker.synthesize,
+                    text=clean_text,
+                    ref_audio_path=ref_audio_path,
+                    language=clean_lang,
+                    output_path=str(output_audio_path),
+                )
+        except Exception as synth_err:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Inference Failure on {worker.device}: {str(synth_err)}",
+            )
+        finally:
+            await gpu_queue.put(worker)
+            gpu_queue.task_done()
+
+        if not output_audio_path.exists() or output_audio_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Model on {worker.device} produced an empty audio file.",
+            )
+
+        with open(output_audio_path, "rb") as out_f:
+            audio_bytes = out_f.read()
+
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={
+                "X-GPU-Device": worker.device,
+                "Content-Disposition": f'attachment; filename="line_{worker.device}.wav"',
+            },
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ── Voice Clone Synthesis Endpoint (Full Upload Fallback) ─────────────────────
 
 @app.post("/voice_clone_synthesis")
 async def voice_clone_synthesis(
