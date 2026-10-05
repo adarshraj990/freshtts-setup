@@ -1,15 +1,22 @@
 """
-🎬 High-Throughput Distributed SRT Voice Cloning & Auto-Dubbing Studio
+🎬 Time-Synchronized Distributed SRT Voice Cloning & Auto-Dubbing Studio
 Frontend: Hugging Face Space (Lightweight Gradio Client, Zero GPU Inference)
 Backend: Remote Dual-GPU Kaggle / Colab XTTS-v2 Engine (2x T4 GPUs)
 
-Optimizations:
-1. Saturated Dual-GPU Parallelism: 5 concurrent threads via ThreadPoolExecutor.
-2. In-Memory & Hash-Based Cache: Idempotent caching skips re-synthesizing repeated lines.
-3. Subtitle Cleansing: Automatic filtering of empty lines, timestamps, and non-spoken artifacts.
-4. Fast In-Memory Audio Assembly: Direct BytesIO processing + pydub concatenation with 200ms gap.
-5. Automatic 1-Time Retry & Timeout Guard: Resilient against intermittent dropped network packets.
-6. Localtunnel & Ngrok Bypass: Automatic headers bypass tunnel reminder landing pages.
+Key Features & Pipeline Architecture:
+1. Full-Sentence Processing: Sends complete, natural subtitle lines to maintain natural prosody and emotion.
+2. Accurate SRT Time-Sync:
+   - Dead silence stripping via pydub.silence (-40 dBFS threshold).
+   - Target slot duration calculation (end_time_ms - start_time_ms).
+   - Gentle time-stretching / speed-up if audio exceeds subtitle window.
+   - Exact placement at start_time_ms onto an empty master canvas of total video duration.
+3. Automated Retry Mechanism: 3-attempt retry loop with 2-second delay on network/500 errors.
+4. Dual-GPU Saturation: 2 concurrent ThreadPool workers perfectly saturate 2x T4 GPUs.
+5. Persistent Generation History Gallery:
+   - Master WAVs permanently preserved in local outputs/ directory (never auto-deleted).
+   - Built-in History Gallery with dropdown selector, preview audio player, and download button.
+   - Manual 'Delete Selected Audio' and 'Clear All History' controls.
+6. Non-Blocking Health Check: Instant roundtrip ping with Localtunnel/Ngrok bypass headers.
 """
 
 import base64
@@ -117,6 +124,8 @@ except Exception:
 
 import gradio as gr
 from pydub import AudioSegment
+from pydub.silence import detect_leading_silence
+from pydub.effects import speedup
 import pysrt
 import requests
 
@@ -131,7 +140,7 @@ TUNNEL_HEADERS = {
     "Bypass-Tunnel-Reminder": "true",
     "bypass-tunnel-reminder": "true",
     "ngrok-skip-browser-warning": "true",
-    "User-Agent": "AudioGenFlow-DualGPU-Client/1.0",
+    "User-Agent": "AudioGenFlow-DualGPU-Client/2.0",
 }
 
 # In-Memory Cache for Idempotent Operations (Thread-Safe)
@@ -139,7 +148,7 @@ AUDIO_CACHE: Dict[str, bytes] = {}
 CACHE_LOCK = threading.Lock()
 
 
-# ── Subtitle Cleansing & Filtering ────────────────────────────────────────────
+# ── Audio Processing & Subtitle Cleansing ─────────────────────────────────────
 
 def clean_subtitle_text(raw_text: str) -> str:
     """
@@ -159,13 +168,64 @@ def clean_subtitle_text(raw_text: str) -> str:
     return text
 
 
+def strip_dead_silence(seg: AudioSegment, threshold: float = -40.0, margin_ms: int = 25) -> AudioSegment:
+    """
+    Strips leading and trailing dead silence below threshold (~ -40 dBFS),
+    leaving a minimal comfortable margin so word onsets and offsets sound natural.
+    """
+    if len(seg) < 100:
+        return seg
+    try:
+        lead = detect_leading_silence(seg, silence_threshold=threshold, chunk_size=10)
+        trail = detect_leading_silence(seg.reverse(), silence_threshold=threshold, chunk_size=10)
+        if lead + trail >= len(seg):
+            return seg
+        start_cut = max(0, lead - margin_ms)
+        end_cut = max(start_cut + 50, len(seg) - max(0, trail - margin_ms))
+        return seg[start_cut:end_cut]
+    except Exception:
+        return seg
+
+
+def fit_audio_to_slot(seg: AudioSegment, slot_duration_ms: int, max_speedup: float = 1.35) -> AudioSegment:
+    """
+    If audio exceeds the subtitle slot window (end_time_ms - start_time_ms),
+    gently time-stretches / speeds it up to fit cleanly without overlapping.
+    """
+    if slot_duration_ms <= 0 or len(seg) <= slot_duration_ms:
+        return seg
+
+    speed_ratio = len(seg) / float(slot_duration_ms)
+    # If overhang is negligible (<= 5%), keep as is
+    if speed_ratio <= 1.05:
+        return seg
+
+    speed_factor = min(speed_ratio, max_speedup)
+    try:
+        chunk_size = min(100, max(20, len(seg) // 6))
+        sped_up = speedup(seg, playback_speed=speed_factor, chunk_size=chunk_size, crossfade=15)
+        # If still exceeding slot by more than 80ms, gently fade out tail
+        if len(sped_up) > slot_duration_ms + 80:
+            sped_up = sped_up[: slot_duration_ms + 80].fade_out(25)
+        return sped_up
+    except Exception as e:
+        safe_print(f"Speedup notice: {e}, falling back to frame rate adjustment")
+        try:
+            stretched = seg._spawn(seg.raw_data, overrides={
+                "frame_rate": int(seg.frame_rate * speed_factor)
+            }).set_frame_rate(seg.frame_rate)
+            return stretched
+        except Exception:
+            return seg
+
+
 def get_cache_key(text: str, language: str, voice_hash: str) -> str:
     """Computes a unique MD5 hash key for caching speech audio."""
     raw = f"{text}|{language}|{voice_hash}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-# ── Single-Chunk Synthesis with 1-Time Retry ───────────────────────────────────
+# ── Single-Chunk Synthesis with Automated 3-Attempt Retry ─────────────────────
 
 def synthesize_chunk_with_retry(
     endpoint: str,
@@ -174,11 +234,12 @@ def synthesize_chunk_with_retry(
     ref_audio_path: str,
     mime_type: str,
     timeout_sec: int = 120,
-    max_retries: int = 1,
+    max_retries: int = 3,
+    retry_delay_sec: float = 2.0,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    Dispatches a single subtitle chunk to the Kaggle Dual-GPU backend.
-    Includes automated 1-time retry for intermittent dropped packets.
+    Dispatches a single subtitle line to the Kaggle Dual-GPU backend.
+    Includes an automated 3-attempt retry loop with a 2-second backoff delay.
     """
     data = {
         "text": text,
@@ -188,8 +249,9 @@ def synthesize_chunk_with_retry(
     }
 
     filename = Path(ref_audio_path).name
+    last_error = "Unknown error"
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             with open(ref_audio_path, "rb") as f1, open(ref_audio_path, "rb") as f2:
                 files = [
@@ -218,28 +280,40 @@ def synthesize_chunk_with_retry(
                         return None, f"JSON parse error: {json_err}"
 
                 # Direct binary audio stream
-                return resp.content, None
+                if resp.content and len(resp.content) > 100:
+                    return resp.content, None
+                else:
+                    last_error = "Empty audio response from backend"
 
-            elif attempt < max_retries and resp.status_code in [500, 502, 503, 504]:
-                time.sleep(1.0)
-                continue
+            elif resp.status_code in [500, 502, 503, 504]:
+                try:
+                    err_json = resp.json()
+                    detail = err_json.get("detail", resp.text[:140])
+                    last_error = f"HTTP {resp.status_code}: {detail}"
+                except Exception:
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:140]}"
             else:
                 try:
                     err_json = resp.json()
                     detail = err_json.get("detail", resp.text[:140])
-                    return None, f"HTTP {resp.status_code}: {detail}"
+                    last_error = f"HTTP {resp.status_code}: {detail}"
                 except Exception:
-                    return None, f"HTTP {resp.status_code}: {resp.text[:140]}"
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:140]}"
+
+                # If HTTP 400 (bad request), don't retry as it is a client validation error
+                if resp.status_code == 400:
+                    return None, last_error
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-            if attempt < max_retries:
-                time.sleep(1.0)
-                continue
-            return None, f"Network Timeout / Disconnect: {type(net_err).__name__}"
+            last_error = f"Network Timeout / Connection Error: {type(net_err).__name__}"
         except Exception as e:
-            return None, f"Error: {str(e)}"
+            last_error = f"Request error: {str(e)}"
 
-    return None, "Failed after retry"
+        if attempt < max_retries:
+            safe_print(f"⚠️ [Attempt {attempt}/{max_retries} failed] {last_error} -> Retrying in {retry_delay_sec}s...")
+            time.sleep(retry_delay_sec)
+
+    return None, f"Failed after {max_retries} attempts ({last_error})"
 
 
 # ── Interactive Backend Connection Health Check ──────────────────────────────
@@ -271,7 +345,7 @@ def check_connection_health(api_url: str):
 
     t0 = time.time()
     try:
-        # Ping the root URL with short 7-second timeout and tunnel bypass headers
+        # Ping root URL with 7-second timeout and tunnel bypass headers
         resp = requests.get(
             f"{root_url}/",
             headers=TUNNEL_HEADERS,
@@ -280,10 +354,7 @@ def check_connection_health(api_url: str):
         )
         latency_ms = max(1, int((time.time() - t0) * 1000))
 
-        # Status code evaluation:
-        # 200, 204: Active and healthy
-        # 301, 302, 307, 308: Active redirection
-        # 404, 405: Remote server is alive and responding (FastAPI / Flask root)
+        # Status code evaluation
         if resp.status_code in [200, 204, 301, 302, 307, 308, 404, 405]:
             yield f"✅ **Connected (Latency: {latency_ms}ms)**"
         elif resp.status_code in [502, 503, 504]:
@@ -299,7 +370,40 @@ def check_connection_health(api_url: str):
         yield f"❌ **Connection Failed / Timeout** ({str(e)[:100]})"
 
 
-# ── High-Throughput Saturated SRT Voice Cloning Engine ────────────────────────
+# ── Persistent Generation History Management ──────────────────────────────────
+
+def get_history_records() -> Tuple[List[Tuple[str, str]], List[List[str]], Optional[str]]:
+    """
+    Scans the outputs directory and returns:
+    1. choices for dropdown: [(label, filepath_str), ...]
+    2. table data: [[filename, size_str, created_time], ...]
+    3. latest file path (or None)
+    """
+    if not OUTPUT_DIR.exists():
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(
+        [p for p in OUTPUT_DIR.glob("*.wav") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    choices: List[Tuple[str, str]] = []
+    table_data: List[List[str]] = []
+    latest_file: Optional[str] = str(files[0]) if files else None
+
+    for f in files:
+        stat = f.stat()
+        size_mb = f"{stat.st_size / (1024 * 1024):.2f} MB"
+        created_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        label = f"{f.name} ({size_mb} • {created_str})"
+        choices.append((label, str(f)))
+        table_data.append([f.name, size_mb, created_str])
+
+    return choices, table_data, latest_file
+
+
+# ── High-Throughput Time-Synchronized SRT Voice Cloning Pipeline ──────────────
 
 def run_high_throughput_srt_pipeline(
     kaggle_url: str,
@@ -307,18 +411,18 @@ def run_high_throughput_srt_pipeline(
     language_code: str,
     use_default_voice: bool,
     custom_voice_file: Optional[str],
-    concurrent_workers: int = 5,
+    concurrent_workers: int = 2,
     progress=gr.Progress(track_tqdm=False),
-) -> Tuple[Optional[str], Optional[str], str]:
+):
     """
-    Max-Throughput Dual-GPU SRT Dubbing Engine:
-    1. Validates dynamic URL and sanitizes endpoint.
-    2. Resolves reference voice sample and calculates voice MD5 hash.
-    3. Parses and cleans SRT subtitle blocks (skips empty lines/artifacts).
-    4. Saturated Parallelism: 5 concurrent threads via ThreadPoolExecutor.
-    5. In-Memory Cache Lookup: Skips re-synthesizing repeated dialogue lines.
-    6. Fast In-Memory Assembly: Direct BytesIO concatenation with 200ms gap.
-    7. Memory/Disk Optimization: Discards temporary chunk buffers immediately.
+    Time-Synchronized Dual-GPU SRT Dubbing Engine:
+    1. Full-Sentence Processing: Sends complete, uninterrupted subtitle lines.
+    2. Silence Stripping: Trims dead silence (-40 dBFS) from generated audio chunks.
+    3. Time-Stretching / Slot-Fitting: Gently speeds up audio exceeding subtitle window.
+    4. Exact Time Placement: Overlays chunks onto an empty master canvas matching total video duration.
+    5. Automated Retry: 3-attempt retry loop on network/500 errors.
+    6. Dual-GPU Saturation: 2 concurrent threads perfectly saturate both T4 GPUs.
+    7. Persistent History: Automatically registers output in the local exports gallery.
     """
     logs: List[str] = []
     log_lock = threading.Lock()
@@ -331,7 +435,7 @@ def run_high_throughput_srt_pipeline(
         safe_print(entry)
 
     t_start = time.time()
-    log("🚀 Initializing Saturated Dual-GPU SRT Dubbing Pipeline...")
+    log("🚀 Initializing Time-Synchronized Dual-GPU SRT Dubbing Pipeline...")
 
     # 1. Validate & Sanitize Kaggle API URL
     if not kaggle_url or not kaggle_url.strip():
@@ -376,7 +480,7 @@ def run_high_throughput_srt_pipeline(
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    log(f"📄 Parsing and cleansing SRT subtitles: `{Path(srt_file).name}`...")
+    log(f"📄 Parsing SRT subtitles: `{Path(srt_file).name}`...")
     try:
         try:
             subs = pysrt.open(srt_file, encoding="utf-8")
@@ -392,15 +496,30 @@ def run_high_throughput_srt_pipeline(
         log(f"❌ {err}")
         raise gr.Error(err)
 
+    # Calculate total timeline duration from last subtitle's end time (+ 1500ms tail)
+    last_sub_end_ms = max(sub.end.ordinal for sub in subs)
+    total_video_duration_ms = last_sub_end_ms + 1500
+    timeline_mins = total_video_duration_ms // 60000
+    timeline_secs = (total_video_duration_ms % 60000) // 1000
+    log(f"⏱️ Full Video Timeline Target: {timeline_mins}m {timeline_secs}s ({total_video_duration_ms} ms)")
+
     # Filter out empty lines, subtitle tags, and pure timestamp artifacts
-    cleaned_chunks: List[Tuple[int, int, str]] = []
+    # Guarantee COMPLETE, UNINTERRUPTED sentences are sent
+    cleaned_chunks: List[Tuple[int, int, int, int, str]] = []
     skipped_count = 0
 
     for i, sub in enumerate(subs, start=1):
-        cleaned_text = clean_subtitle_text(sub.text)
+        # Join multi-line subtitle blocks into a single natural sentence
+        raw_sentence = " ".join(line.strip() for line in sub.text.splitlines() if line.strip())
+        cleaned_text = clean_subtitle_text(raw_sentence)
+
+        start_ms = sub.start.ordinal
+        end_ms = sub.end.ordinal
+        slot_duration_ms = max(400, end_ms - start_ms)
+
         # Check if text contains spoken characters (alphanumeric in any language)
         if cleaned_text and re.search(r"\w", cleaned_text, re.UNICODE):
-            cleaned_chunks.append((i, sub.start.ordinal, cleaned_text))
+            cleaned_chunks.append((i, start_ms, end_ms, slot_duration_ms, cleaned_text))
         else:
             skipped_count += 1
 
@@ -408,35 +527,42 @@ def run_high_throughput_srt_pipeline(
     log(f"📊 SRT Parsing Complete: {len(subs)} total blocks loaded.")
     if skipped_count > 0:
         log(f"⚡ Skipped {skipped_count} empty / non-spoken artifact blocks to save GPU cycles.")
-    log(f"🎯 Valid Dialogue Chunks to Synthesize: **{total_chunks}**")
+    log(f"🎯 Valid Full-Sentence Dialogue Lines to Synthesize: **{total_chunks}**")
 
     if total_chunks == 0:
         err = "No valid spoken dialogue found in the SRT file after cleansing."
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    # 4. Saturated Parallelism Execution (ThreadPoolExecutor)
-    num_workers = max(2, min(int(concurrent_workers), 8))
-    log(f"⚡ Launching Saturated Dual-GPU Worker Pool with **{num_workers} parallel threads**...")
+    # 4. Saturated Dual-GPU Execution (ThreadPoolExecutor)
+    # Default 2 workers saturates 2x T4 GPUs with zero queue contention
+    num_workers = max(1, min(int(concurrent_workers), 4))
+    log(f"⚡ Launching Saturated Dual-GPU Worker Pool with **{num_workers} concurrent threads**...")
 
-    generated_segments: Dict[int, AudioSegment] = {}
+    generated_segments: Dict[int, Tuple[int, AudioSegment]] = {}
     completed_chunks = 0
     cache_hits = 0
     lang = language_code.strip().lower()
 
-    def process_sub_block(chunk_info: Tuple[int, int, str]) -> Tuple[int, Optional[AudioSegment], Optional[str]]:
+    def process_sub_block(chunk_info: Tuple[int, int, int, int, str]) -> Tuple[int, int, Optional[AudioSegment], Optional[str]]:
         nonlocal cache_hits
-        idx, start_ms, text = chunk_info
+        idx, start_ms, end_ms, slot_duration_ms, text = chunk_info
         cache_key = get_cache_key(text, lang, voice_hash)
 
-        # 1. Check in-memory cache (Idempotent operation)
+        # 1. Check in-memory cache
         with CACHE_LOCK:
             if cache_key in AUDIO_CACHE:
                 cached_bytes = AUDIO_CACHE[cache_key]
                 seg = AudioSegment.from_file(io.BytesIO(cached_bytes))
-                return idx, seg, "CACHE_HIT"
+                # Post-process: normalize, strip silence, slot-fit, micro-fade
+                seg = seg.set_frame_rate(24000).set_channels(1)
+                seg = strip_dead_silence(seg, threshold=-40.0)
+                seg = fit_audio_to_slot(seg, slot_duration_ms=slot_duration_ms)
+                if len(seg) > 30:
+                    seg = seg.fade_in(10).fade_out(10)
+                return idx, start_ms, seg, "CACHE_HIT"
 
-        # 2. Remote Dual-GPU Synthesis Call with retry
+        # 2. Remote Dual-GPU Synthesis Call with 3-attempt automated retry
         audio_bytes, err = synthesize_chunk_with_retry(
             endpoint=endpoint,
             text=text,
@@ -444,20 +570,29 @@ def run_high_throughput_srt_pipeline(
             ref_audio_path=ref_path,
             mime_type=mime_type,
             timeout_sec=120,
-            max_retries=1,
+            max_retries=3,
+            retry_delay_sec=2.0,
         )
 
         if audio_bytes and len(audio_bytes) > 100:
             try:
                 seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                # Store in cache
+                # Store raw bytes in cache
                 with CACHE_LOCK:
                     AUDIO_CACHE[cache_key] = audio_bytes
-                return idx, seg, None
+
+                # Post-process: normalize, strip dead silence, slot-fit, micro-fade
+                seg = seg.set_frame_rate(24000).set_channels(1)
+                seg = strip_dead_silence(seg, threshold=-40.0)
+                seg = fit_audio_to_slot(seg, slot_duration_ms=slot_duration_ms)
+                if len(seg) > 30:
+                    seg = seg.fade_in(10).fade_out(10)
+
+                return idx, start_ms, seg, None
             except Exception as dec_err:
-                return idx, None, f"Audio decode error: {dec_err}"
+                return idx, start_ms, None, f"Audio decode error: {dec_err}"
         else:
-            return idx, None, err or "Empty audio response"
+            return idx, start_ms, None, err or "Empty audio response"
 
     # Dispatch tasks across ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -466,7 +601,7 @@ def run_high_throughput_srt_pipeline(
         }
 
         for future in as_completed(future_to_chunk):
-            sub_idx, seg, status = future.result()
+            sub_idx, start_ms, seg, status = future.result()
             completed_chunks += 1
             progress_ratio = completed_chunks / total_chunks
             elapsed_current = max(0.1, time.time() - t_start)
@@ -474,71 +609,70 @@ def run_high_throughput_srt_pipeline(
 
             progress(
                 progress_ratio,
-                desc=f"Synthesizing [{completed_chunks}/{total_chunks}] ({throughput:.1f} chunks/s)...",
+                desc=f"Synthesizing [{completed_chunks}/{total_chunks}] ({throughput:.1f} lines/s)...",
             )
 
             if seg is not None:
-                generated_segments[sub_idx] = seg
+                generated_segments[sub_idx] = (start_ms, seg)
                 if status == "CACHE_HIT":
                     cache_hits += 1
-                    log(f"⚡ [Chunk #{sub_idx}/{total_chunks}] Cache Hit (0ms) | Throughput: {throughput:.2f} chunks/s")
+                    log(f"⚡ [Line #{sub_idx}/{total_chunks}] Cache Hit (0ms) | Throughput: {throughput:.2f} lines/s")
                 else:
-                    log(f"✅ [Chunk #{sub_idx}/{total_chunks}] Generated & Received | Throughput: {throughput:.2f} chunks/s")
+                    log(f"✅ [Line #{sub_idx}/{total_chunks}] Synthesized & Synced | Throughput: {throughput:.2f} lines/s")
             else:
-                log(f"⚠️ [Chunk #{sub_idx}/{total_chunks}] Failed: {status}")
+                log(f"⚠️ [Line #{sub_idx}/{total_chunks}] Failed: {status}")
 
-    # 5. Fast Audio Assembly with Low-Latency Gap (200ms)
-    progress(0.95, desc="Concatenating audio segments in chronological order...")
-    log(f"🎼 Assembling {len(generated_segments)} audio segments in exact subtitle index order...")
+    # 5. Precise Master Audio Timeline Assembly
+    progress(0.95, desc="Overlaying audio segments onto master video timeline...")
+    log(f"🎼 Assembling {len(generated_segments)} segments onto {timeline_mins}m {timeline_secs}s silent master canvas...")
 
     if not generated_segments:
         err = "All subtitle segments failed to synthesize. Please check your Kaggle GPU notebook logs."
         log(f"❌ {err}")
         raise gr.Error(err)
 
-    # Sort segments strictly by subtitle index
-    sorted_indices = sorted(generated_segments.keys())
-    gap_duration_ms = 200
-    gap = AudioSegment.silent(duration=gap_duration_ms, frame_rate=24000)
+    # Create empty master AudioSegment matching total video duration
+    master_canvas = AudioSegment.silent(duration=total_video_duration_ms, frame_rate=24000).set_channels(1)
 
-    master_audio = None
-    for idx in sorted_indices:
-        seg = generated_segments[idx]
-        if seg.frame_rate != 24000:
-            seg = seg.set_frame_rate(24000)
-        if seg.channels != 1:
-            seg = seg.set_channels(1)
+    # Place each segment at its exact start_time_ms
+    for idx in sorted(generated_segments.keys()):
+        start_ms, seg = generated_segments[idx]
+        master_canvas = master_canvas.overlay(seg, position=start_ms)
 
-        # Smooth 15ms micro-fade to avoid boundary clicks
-        if len(seg) > 30:
-            seg = seg.fade_in(15).fade_out(15)
-
-        if master_audio is None:
-            master_audio = seg
-        else:
-            master_audio = master_audio + gap + seg
-
-    # 6. Direct Export & Immediate Memory Cleanup
-    progress(0.98, desc="Exporting optimized master WAV...")
+    # 6. Direct Export to outputs/ directory (Permanent storage)
+    progress(0.98, desc="Exporting time-synchronized master WAV...")
     output_filename = f"dubbed_master_{lang}_{int(time.time())}.wav"
     output_path = OUTPUT_DIR / output_filename
 
-    master_audio.export(str(output_path), format="wav")
+    master_canvas.export(str(output_path), format="wav")
     final_file_size_mb = output_path.stat().st_size / (1024 * 1024)
 
     # Free memory buffers immediately
     del generated_segments
-    del master_audio
+    del master_canvas
 
     total_time = time.time() - t_start
     avg_speed = total_chunks / max(0.1, total_time)
 
-    log(f"🎉 Pipeline finished in {total_time:.2f}s ({avg_speed:.2f} dialogue chunks/sec)!")
-    log(f"📊 Completed: {completed_chunks}/{total_chunks} chunks ({cache_hits} cache hits).")
+    log(f"🎉 Pipeline finished in {total_time:.2f}s ({avg_speed:.2f} lines/sec)!")
+    log(f"📊 Completed: {completed_chunks}/{total_chunks} lines ({cache_hits} cache hits).")
     log(f"📁 Master Output File: `{output_filename}` ({final_file_size_mb:.2f} MB)")
+    log(f"💾 Permanently saved to outputs/ and registered in generation history.")
     progress(1.0, desc="Dubbing complete!")
 
-    return str(output_path), str(output_path), "\n".join(logs)
+    # Refresh history records
+    hist_choices, hist_table, _ = get_history_records()
+
+    return (
+        str(output_path),
+        str(output_path),
+        "\n".join(logs),
+        gr.update(choices=hist_choices, value=str(output_path)),
+        hist_table,
+        str(output_path),
+        str(output_path),
+        f"✅ Generated & Saved: `{output_filename}` ({final_file_size_mb:.2f} MB)",
+    )
 
 
 # ── Gradio Web UI Layout ──────────────────────────────────────────────────────
@@ -546,13 +680,15 @@ def run_high_throughput_srt_pipeline(
 def build_app() -> gr.Blocks:
     theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")
 
+    initial_choices, initial_table, initial_latest = get_history_records()
+
     with gr.Blocks(theme=theme, title="🎬 Saturated Dual-GPU SRT Dubbing Studio") as demo:
         # Header Banner
         gr.Markdown(
             """
             # 🎬 Saturated Dual-GPU SRT Voice Cloning Studio
-            ### ⚡ High-Throughput Subtitle Auto-Dubbing via Remote Kaggle Dual T4 GPUs
-            Saturate both GPU workers with 5 concurrent threads, in-memory caching, and automated packet-drop retries.
+            ### ⚡ Time-Synchronized Subtitle Auto-Dubbing via Remote Kaggle Dual T4 GPUs
+            Full-sentence prosody, dead silence stripping (-40 dBFS), slot-fitting time stretch, 3-attempt auto-retry, and persistent exports gallery.
             """
         )
 
@@ -628,29 +764,74 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("⚙️ Dual-GPU Concurrency Tuning", open=False):
                     workers_slider = gr.Slider(
                         label="Concurrent ThreadPool Workers",
-                        minimum=2,
-                        maximum=8,
-                        value=5,
+                        minimum=1,
+                        maximum=4,
+                        value=2,
                         step=1,
-                        info="5 workers optimally saturates 2x T4 GPUs without queuing bottlenecks.",
+                        info="2 workers perfectly saturates 2x T4 GPUs on Kaggle without overloading worker locks.",
                     )
 
-                submit_btn = gr.Button("🚀 Start Saturated Dual-GPU Dubbing", variant="primary", size="lg")
+                submit_btn = gr.Button("🚀 Start Time-Synced Dual-GPU Dubbing", variant="primary", size="lg")
 
             # RIGHT COLUMN: Audio Output & Live Throughput Logs
             with gr.Column(scale=5):
-                gr.Markdown("### 🎧 2. Final Dubbed Master Output")
-                audio_player = gr.Audio(label="Final Merged Audio Player", type="filepath")
+                gr.Markdown("### 🎧 2. Current Dubbed Master Output")
+                audio_player = gr.Audio(label="Time-Synchronized Master Audio Player", type="filepath")
                 download_file = gr.File(label="📥 Download Master WAV")
 
-                gr.Markdown("### 📊 3. Real-Time Throughput & Progress Log")
+                gr.Markdown("### 📊 3. Real-Time Timeline & Progress Log")
                 logs_box = gr.Textbox(
-                    label="Throughput & Progress Status Log",
-                    lines=12,
+                    label="Timeline & Throughput Status Log",
+                    lines=10,
                     autoscroll=True,
-                    placeholder="Real-time chunk progress, throughput (chunks/sec), and cache hits will appear here...",
+                    placeholder="Real-time chunk progress, SRT time-sync, latency, and cache hits will appear here...",
                 )
 
+        # ── PERSISTENT GENERATION HISTORY GALLERY ─────────────────────────────
+        gr.Markdown("---")
+        with gr.Accordion("📁 4. Persistent Generation History & Exports Gallery", open=True):
+            gr.Markdown(
+                """
+                **Local Audio Archive**: All generated full-timeline master audios are permanently preserved in the local `outputs/` folder.
+                Files are **never** automatically deleted after downloading. Select any past generation to preview or download, or manage files below.
+                """
+            )
+            with gr.Row():
+                with gr.Column(scale=6):
+                    history_dropdown = gr.Dropdown(
+                        label="Select Master Audio from History",
+                        choices=initial_choices,
+                        value=initial_latest,
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        refresh_history_btn = gr.Button("🔄 Refresh List", variant="secondary", size="sm")
+                        delete_selected_btn = gr.Button("🗑️ Delete Selected Audio", variant="stop", size="sm")
+                        clear_all_btn = gr.Button("⚠️ Clear All History", variant="secondary", size="sm")
+                    history_status_md = gr.Markdown("Ready.")
+
+                with gr.Column(scale=4):
+                    history_player = gr.Audio(
+                        label="History Audio Player",
+                        type="filepath",
+                        value=initial_latest,
+                    )
+                    history_download = gr.File(
+                        label="📥 Download Selected Audio",
+                        value=initial_latest,
+                    )
+
+            history_table = gr.Dataframe(
+                headers=["Filename", "Size (MB)", "Created Timestamp"],
+                datatype=["str", "str", "str"],
+                value=initial_table,
+                label="Stored Audio Files in outputs/",
+                interactive=False,
+            )
+
+        # ── Event Bindings ───────────────────────────────────────────────────
+
+        # Connection Health Check
         check_conn_btn.click(
             fn=check_connection_health,
             inputs=[kaggle_url_input],
@@ -663,6 +844,7 @@ def build_app() -> gr.Blocks:
             outputs=[conn_status_box],
         )
 
+        # Main Synthesis Pipeline
         submit_btn.click(
             fn=run_high_throughput_srt_pipeline,
             inputs=[
@@ -677,6 +859,112 @@ def build_app() -> gr.Blocks:
                 audio_player,
                 download_file,
                 logs_box,
+                history_dropdown,
+                history_table,
+                history_player,
+                history_download,
+                history_status_md,
+            ],
+        )
+
+        # History Actions
+        def on_select_history(selected_path: Optional[str]):
+            if selected_path and os.path.isfile(selected_path):
+                return selected_path, selected_path
+            return None, None
+
+        history_dropdown.change(
+            fn=on_select_history,
+            inputs=[history_dropdown],
+            outputs=[history_player, history_download],
+        )
+
+        def on_refresh_history():
+            choices, table_data, latest = get_history_records()
+            return (
+                gr.update(choices=choices, value=latest),
+                table_data,
+                latest,
+                latest,
+                f"✅ Gallery refreshed. {len(choices)} files available.",
+            )
+
+        refresh_history_btn.click(
+            fn=on_refresh_history,
+            outputs=[
+                history_dropdown,
+                history_table,
+                history_player,
+                history_download,
+                history_status_md,
+            ],
+        )
+
+        def on_delete_selected(selected_path: Optional[str]):
+            if not selected_path or not os.path.isfile(selected_path):
+                choices, table_data, latest = get_history_records()
+                return (
+                    gr.update(choices=choices, value=latest),
+                    table_data,
+                    latest,
+                    latest,
+                    "⚠️ No audio selected to delete.",
+                )
+            try:
+                name = Path(selected_path).name
+                os.remove(selected_path)
+                msg = f"🗑️ Deleted `{name}` successfully."
+            except Exception as e:
+                msg = f"❌ Error deleting file: {e}"
+
+            choices, table_data, latest = get_history_records()
+            return (
+                gr.update(choices=choices, value=latest),
+                table_data,
+                latest,
+                latest,
+                msg,
+            )
+
+        delete_selected_btn.click(
+            fn=on_delete_selected,
+            inputs=[history_dropdown],
+            outputs=[
+                history_dropdown,
+                history_table,
+                history_player,
+                history_download,
+                history_status_md,
+            ],
+        )
+
+        def on_clear_all():
+            choices, _, _ = get_history_records()
+            count = 0
+            for _, path_str in choices:
+                try:
+                    if os.path.isfile(path_str):
+                        os.remove(path_str)
+                        count += 1
+                except Exception:
+                    pass
+            choices, table_data, latest = get_history_records()
+            return (
+                gr.update(choices=choices, value=None),
+                table_data,
+                None,
+                None,
+                f"🧹 Cleared {count} audio files from history.",
+            )
+
+        clear_all_btn.click(
+            fn=on_clear_all,
+            outputs=[
+                history_dropdown,
+                history_table,
+                history_player,
+                history_download,
+                history_status_md,
             ],
         )
 
